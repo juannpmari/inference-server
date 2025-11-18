@@ -1,3 +1,15 @@
+# Load-aware and prefix-cache router
+
+# TODO: implement true load-aware routing (ie., based on queue length)
+def route(model_name: str, lora_adapter: str):
+    """
+    Route to the correct pods based on model name and lora adapter
+    The load-aware routing will be done by k8s service
+    """
+    pass
+
+
+
 # API gateway (fastapi)
 
 from fastapi import FastAPI

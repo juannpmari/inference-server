@@ -1,3 +1,5 @@
+# Inference service with sidecar using just kubernetes, suitable for single-node inference.
+# for multi-node inference, use RayClusterFleet.
 apiVersion: v1
 kind: Pod
 metadata:

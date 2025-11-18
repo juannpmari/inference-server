@@ -1,4 +1,6 @@
 # Sidecar
+# Exposes metrics (queue depth, KV cache usage) to the controller
+# Its role is to expose metrics and handle management tasks (like LoRA loading).
 
 from inference.inference import Engine
 # from inference.kv_cache import KVCache
