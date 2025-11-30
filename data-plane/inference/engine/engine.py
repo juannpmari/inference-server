@@ -1,6 +1,7 @@
-from vllm import EngineArgs, LLMEngine, SamplingParams, RequestOutput
+from vllm import EngineArgs, LLMEngine, SamplingParams
 from vllm.utils import FlexibleArgumentParser # A custom parser for vLLM
-import uuid
+from typing import Dict, List, Any
+import asyncio
 
 class Engine:
     def __init__(self, model_name: str, lora_adapter: str = None, args: dict = {}):
@@ -22,7 +23,7 @@ class Engine:
         
         self.engine =  LLMEngine.from_engine_args(engine_args)
         self.request_counter = 0
-        self.request_futures:DictÑ[str,asyncio.Future] = {}
+        self.request_futures:Dict[str,asyncio.Future] = {}
 
     async def add_request(self, prompt: str, sampling_params: SamplingParams = {}):
         request_id = str(self.request_counter)
