@@ -44,14 +44,12 @@ def readiness_check():
         return {"status": "ready", "registry": manager.registry}
     raise HTTPException(status_code=status.HTTP_503_SERVICE_UNAVAILABLE, detail="Artifact Manager loading initial model.")
 
-
-
 @app.post("/load/{model_identifier}")
 async def load_model_route(model_identifier: str, version: str, remote_url: Optional[str] = None):
     """API to load a specific model version and update the in-memory registry."""
     
     try:
-        local_path = await manager.load_model(model_identifier, version, remote_url)
+        local_path = await manager.load_model(model_identifier, version)
         return {"status": "success", "model_identifier": model_identifier, "local_path": local_path}
     
     except Exception as e:
@@ -59,8 +57,8 @@ async def load_model_route(model_identifier: str, version: str, remote_url: Opti
 
 @app.get("/registry")
 def get_registry():
-    """Returns the current state of resident models (used by Inference Manager)."""
-    return {"resident_models": manager.registry}
+    """Returns the current state of resident artifacts (models and adapters)."""
+    return {"resident_models": manager.registry, "resident_adapters": manager.adapter_registry}
 
 @app.post("/unload/{model_identifier}")
 def unload_model_route(model_identifier: str):
@@ -70,3 +68,16 @@ def unload_model_route(model_identifier: str):
         
     manager.unload_model(model_identifier)
     return {"status": "success", "model_identifier": model_identifier}
+
+@app.post("/adapter/fetch/{adapter_identifier}")
+async def fetch_adapter_route(adapter_identifier: str, version: str):
+    """
+    API to ensure a LoRA adapter's delta weights are present on the shared disk.
+    Called by the Inference Manager before asking vLLM to load the adapter into VRAM.
+    """
+    try:
+        local_path = await manager.fetch_adapter(adapter_identifier, version)
+        return {"status": "success", "adapter_identifier": adapter_identifier, "local_path": local_path}
+    except Exception as e:
+        raise HTTPException(status_code=status.HTTP_500_INTERNAL_SERVER_ERROR, detail=f"Failed to fetch adapter: {str(e)}")
+    
