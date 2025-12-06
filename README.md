@@ -1,102 +1,145 @@
-AIBrix Replica: Hybrid Orchestration for LLM Serving
+# Hybrid Orchestration for LLM Serving
 
-This project replicates the core control plane and data plane architecture of a modern LLM serving system like AIBrix. It is structured to separate orchestration logic (Control Plane) from serving logic (Data Plane), enabling scalable, model-aware, and LoRA-enabled inference.
+A high-performance, scalable, and flexible LLM serving system with dynamic model loading and LoRA adapter support. This project implements a production-grade architecture that separates orchestration (Control Plane) from serving (Data Plane), enabling efficient resource utilization and dynamic scaling.
 
-Architecture Overview
+## 🌟 Features
 
-The system is split into two primary layers:
+- **Unified API Gateway**: OpenAI-compatible API endpoints for seamless integration
+- **Dynamic Model Loading**: On-demand loading and unloading of LLM models
+- **LoRA Adapter Support**: Runtime loading and switching of LoRA adapters
+- **Horizontal Auto-scaling**: Dynamic scaling based on real-time metrics
+- **Multi-tenant Support**: Isolated model instances with resource quotas
+- **Metrics & Monitoring**: Built-in Prometheus metrics and Grafana dashboards
+- **Kubernetes Native**: Designed to run on Kubernetes with custom resource definitions
 
-Control Plane: External Kubernetes Controllers responsible for managing the desired state of the system (scaling, LoRA configuration).
+## 🏗️ Architecture Overview
 
-Data Plane: The user-facing services and the LLM inference engine that executes requests and exposes metrics.
+### High-Level Architecture
 
-The entire system is designed to run on a Kubernetes cluster, where the Control Plane manipulates Custom Resources (CRDs) and standard Deployments to manage the Data Plane.
+```mermaid
+graph TD
+    A[Client] -->|HTTP/HTTPS| B[API Gateway]
+    B -->|Route by Model| C[Inference Service 1]
+    B -->|Route by Model| D[Inference Service 2]
+    C -->|Load/Unload| E[Model Repository]
+    D -->|Load/Unload| E
+    F[Control Plane] -->|Manage| C
+    F -->|Manage| D
+    G[Monitoring] -->|Scrape| C
+    G -->|Scrape| D
+```
 
-Directory Structure and Component Descriptions
+### Core Components
 
-1. /control-plane
+1. **Control Plane**
+   - Manages system state and orchestration
+   - Handles model lifecycle and scaling decisions
+   - Implements custom Kubernetes controllers
 
-These Python scripts run as dedicated Kubernetes Controllers. They are the "brains" of the system, implementing the core orchestration logic.
+2. **Data Plane**
+   - Handles model inference
+   - Manages local resources
+   - Exposes metrics and health endpoints
 
-File
+## 🗂️ Directory Structure
 
-Role
+```
+inference-server/
+├── control-plane/           # Control plane components
+│   ├── lora_manager.py      # LoRA adapter management
+│   └── autoscaler.py        # Auto-scaling controller
+├── data-plane/
+│   ├── gateway/            # API Gateway service
+│   │   └── routing_service.py
+│   └── inference/          # Core inference engine
+│       ├── engine_api.py
+│       └── sidecar_runtime.py
+├── docker/                 # Dockerfiles
+│   ├── Dockerfile.controller
+│   └── Dockerfile.gateway
+├── k8s/                    # Kubernetes manifests
+├── tests/                  # Test suites
+└── README.md               # This file
+```
 
-Description
+## Multi-tiered KV Cache
 
-lora_manager.py
+## 🚀 Getting Started
 
-LoRA Controller
+### Prerequisites
 
-This controller watches the Kubernetes API for LoraAdapter Custom Resources (CRDs). When a new adapter is requested, it communicates with the Inference Sidecar of the target LLM deployment, issuing commands to load or unload the adapter from the LLM's memory.
+- Kubernetes cluster (v1.20+)
+- NVIDIA GPU nodes with appropriate drivers
+- kubectl and helm installed
+- Container registry access
 
-autoscaler.py
+### Quick Start
 
-Horizontal Pod Autoscaler
+1. **Clone the repository**
+   ```bash
+   git clone https://github.com/your-org/inference-server.git
+   cd inference-server
+   ```
 
-This script watches custom load metrics (e.g., token queue length) exposed by the Inference Sidecar. Based on observed load, it dynamically scales the number of LLM Inference Pods (replicas) up or down via the Kubernetes API to maintain target performance levels.
+2. **Build and push container images**
+   ```bash
+   docker build -f docker/Dockerfile.controller -t your-registry/controller:latest .
+   docker build -f docker/Dockerfile.gateway -t your-registry/gateway:latest .
+   docker push your-registry/controller:latest
+   docker push your-registry/gateway:latest
+   ```
 
-2. /data-plane
+3. **Deploy to Kubernetes**
+   ```bash
+   kubectl apply -f k8s/namespace.yaml
+   kubectl apply -f k8s/
+   ```
 
-This directory holds the application code for the container images that execute inference and manage local state.
+## 🛠️ Configuration
 
-/data-plane/gateway (The Intelligent Router)
+### Environment Variables
 
-File
+| Variable | Description | Default |
+|----------|-------------|---------|
+| `MODEL_REPOSITORY` | Path to model repository | `/models` |
+| `MAX_CONCURRENT_REQUESTS` | Max concurrent requests per pod | `10` |
+| `LOG_LEVEL` | Logging level | `INFO` |
 
-Role
+### API Endpoints
 
-Description
+- `POST /v1/chat/completions` - Chat completion endpoint
+- `GET /metrics` - Prometheus metrics
+- `POST /v1/adapters` - Manage LoRA adapters
 
-routing_service.py
 
-Intelligent Router
+## 📊 Monitoring
 
-This FastAPI service is the user-facing API endpoint. It provides the OpenAI-compatible interface (/v1/chat/completions). Its primary task is Model-Based Routing: it inspects the request body's model field and dynamically routes the request to the correct Kubernetes Service that fronts the target LLM Deployment (e.g., routing traffic for llama-70b to the llama-70b-svc).
+### Metrics
 
-/data-plane/inference (The LLM Execution Unit)
+The system exposes the following metrics:
 
-These files are bundled into the containers that run on the GPU nodes.
+- `inference_requests_total`: Total number of inference requests
+- `inference_latency_seconds`: Latency histogram
+- `gpu_utilization`: GPU utilization percentage
+- `model_load_time_seconds`: Time to load models
 
-File
+### Dashboards
 
-Role
+Pre-configured Grafana dashboards are available in the `monitoring/` directory.
 
-Description
+## 🤝 Contributing
 
-engine_api.py
+Contributions are welcome! Please read our [Contributing Guidelines](CONTRIBUTING.md) for details.
 
-Inference Engine Entrypoint
+## 📄 License
 
-This is the main container's entrypoint. It launches the underlying LLM serving technology (e.g., vLLM or equivalent) with the required model. It directly exposes the OpenAI-compatible API consumed by the Gateway, handling the actual token generation.
+This project is licensed under the MIT License - see the [LICENSE](LICENSE) file for details.
 
-sidecar_runtime.py
+## 📚 Resources
 
-Local Control Agent (Sidecar)
-
-This lightweight container runs alongside the Inference Engine. It serves two main functions: 1) It exposes a Prometheus-compatible metrics endpoint (queue length, GPU usage) for the Autoscaler. 2) It exposes a local management API used by the LoRA Manager to directly execute LoRA load/unload commands on the local vLLM process.
-
-3. /docker
-
-Contains the Dockerfiles used to build the final container images deployed in Kubernetes.
-
-File
-
-Role
-
-Description
-
-Dockerfile.controller
-
-Control Plane Image
-
-Builds the image containing Python and necessary libraries for the two Control Plane controllers (lora_manager.py and autoscaler.py).
-
-Dockerfile.gateway
-
-Gateway Image
-
-Builds the lightweight image for the FastAPI Intelligent Router (routing_service.py).
+- [Architecture Decision Records](docs/adr/)
+- [API Documentation](docs/api.md)
+- [Performance Benchmarks](docs/benchmarks.md)
 
 Dockerfile.engine
 
