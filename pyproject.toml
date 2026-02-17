@@ -32,7 +32,7 @@ requires = ["hatchling"]
 build-backend = "hatchling.build"
 
 [tool.hatch.build.targets.wheel]
-packages = ["shared", "data-plane", "control-plane"]
+packages = ["shared", "data_plane", "control_plane"]
 
 [tool.pytest.ini_options]
 asyncio_mode = "auto"
@@ -44,6 +44,7 @@ markers = [
 [tool.ruff]
 target-version = "py312"
 line-length = 120
+extend-exclude = ["Makefile"]
 
 [tool.ruff.lint]
 select = ["E", "F", "I", "W"]

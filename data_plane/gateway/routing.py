@@ -25,7 +25,7 @@ async def startup_event():
 @app.on_event("shutdown")
 async def shutdown_event():
     """ Cancel the httpx client when the server shuts down"""
-    await app.state.http_client.close()
+    await app.state.http_client.aclose()
 
 # 2. Model-to-Service Mapping (The "Routing Table")
 # In Kubernetes, this is the Service DNS name pointing to the GPU Worker Pod
@@ -70,12 +70,12 @@ async def generate(event: dict):
     except httpx.ConnectError:
         # Worker is unreachable (Pod down, network issue, or not ready)
         raise HTTPException(
-            status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+            status_code=HTTPStatus.SERVICE_UNAVAILABLE,
             detail=f"Model service '{model_name}' is unreachable."
         )
     except Exception as e:
         # Catch other unexpected errors
         raise HTTPException(
-            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            status_code=HTTPStatus.INTERNAL_SERVER_ERROR,
             detail=f"An unexpected error occurred during routing: {str(e)}"
         )
