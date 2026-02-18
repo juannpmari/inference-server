@@ -1,3 +1,4 @@
+from pydantic import AliasChoices, Field
 from pydantic_settings import BaseSettings
 
 
@@ -15,4 +16,8 @@ class EngineConfig(BaseSettings):
     enable_lora: bool = False
     max_pending: int = 10
     temperature: float = 0.0
-    enable_engine_mock: bool = False  # Set to true to use mock engine (no GPU needed)
+    enable_engine_mock: bool = Field(
+        default=False,
+        validation_alias=AliasChoices("ENABLE_ENGINE_MOCK", "ENGINE_ENABLE_ENGINE_MOCK"),
+        description="Set to true to use mock engine (no GPU needed)"
+    )

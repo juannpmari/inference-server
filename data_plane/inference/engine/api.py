@@ -12,6 +12,7 @@ import time
 from data_plane.inference.engine.config import EngineConfig
 from data_plane.inference.engine import metrics
 
+logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s [%(name)s] %(message)s")
 logger = logging.getLogger(__name__)
 
 
@@ -38,10 +39,10 @@ _config = None
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
+    logger.info("Starting engine...")
     # Startup
     global _engine, _batching_loop, _config
     try:
-        logger.info("Starting engine...")
         _config = EngineConfig()
 
         if _config.enable_engine_mock:
