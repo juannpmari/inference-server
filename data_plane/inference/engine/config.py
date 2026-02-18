@@ -15,3 +15,4 @@ class EngineConfig(BaseSettings):
     enable_lora: bool = False
     max_pending: int = 10
     temperature: float = 0.0
+    enable_engine_mock: bool = False  # Set to true to use mock engine (no GPU needed)

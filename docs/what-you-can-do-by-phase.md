@@ -112,6 +112,9 @@ You can now manually test inference, verify metrics, and prototype requests. If 
 
 ---
 
+### Note
+create a script to compute simple metrics (latency, tokens per second, throughput, etc.), as it will be the baseline for performance testing the future optimizations.
+
 ## Phase D: Fix the Sidecar (parallel with C)
 **Status**: Model management works. Multi-model support ready.
 
