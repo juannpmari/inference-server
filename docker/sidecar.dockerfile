@@ -8,22 +8,19 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     && rm -rf /var/lib/apt/lists/*
 
 # Install uv for fast dependency management
-COPY --from=ghcr.io/astral-sh/uv:latest /uv /usr/local/bin/uv
+RUN pip install --no-cache-dir uv
 
-# Copy dependency files first for cache efficiency
-COPY pyproject.toml uv.lock* ./
-
-# Install production dependencies only
-RUN uv sync --no-dev --no-install-project
+# Copy project metadata and dependency files
+COPY pyproject.toml README.md uv.lock* ./
 
 # Copy application code
 COPY shared/ ./shared/
 COPY data_plane/ ./data_plane/
 
-# Install the project itself
+# Install production dependencies
 RUN uv sync --no-dev
 
-# Create model storage directory
+# Create model storage directory (shared volume with engine)
 RUN mkdir -p /mnt/models
 
 EXPOSE 8001 50051

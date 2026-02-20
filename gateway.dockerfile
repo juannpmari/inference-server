@@ -10,11 +10,12 @@ COPY pyproject.toml README.md uv.lock* ./
 
 # Copy application code
 COPY shared/ ./shared/
-COPY control_plane/ ./control_plane/
+COPY data_plane/ ./data_plane/
 
 # Install production dependencies
 RUN uv sync --no-dev
 
-EXPOSE 8090
+EXPOSE 8000
 
-CMD ["uv", "run", "python", "-m", "control_plane.admission_controller"]
+CMD ["uv", "run", "uvicorn", "data_plane.gateway.routing:app", \
+     "--host", "0.0.0.0", "--port", "8000"]
