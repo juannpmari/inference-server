@@ -1,9 +1,12 @@
-from pydantic import AliasChoices, Field
+from pydantic import Field
 from pydantic_settings import BaseSettings
 
 
 class EngineConfig(BaseSettings):
-    model_config = {"env_prefix": "ENGINE_"}
+    model_config = {
+        "env_prefix": "ENGINE_",
+        "populate_by_name": True,
+    }
 
     model_name: str = "Qwen/Qwen2-0.5B"
     max_model_len: int = 512
@@ -18,6 +21,6 @@ class EngineConfig(BaseSettings):
     temperature: float = 0.0
     enable_engine_mock: bool = Field(
         default=False,
-        validation_alias=AliasChoices("ENABLE_ENGINE_MOCK", "ENGINE_ENABLE_ENGINE_MOCK"),
-        description="Set to true to use mock engine (no GPU needed)"
+        alias="ENABLE_ENGINE_MOCK",
+        description="Set to true to use mock engine (no GPU needed)",
     )
