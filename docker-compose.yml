@@ -2,7 +2,7 @@ services:
   gateway:
     build:
       context: .
-      dockerfile: gateway.dockerfile
+      dockerfile: docker/gateway.dockerfile
     ports:
       - "8000:8000"
     env_file:
