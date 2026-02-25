@@ -1,0 +1,82 @@
+services:
+  gateway:
+    build:
+      context: .
+      dockerfile: docker/gateway.dockerfile
+    ports:
+      - "8000:8000"
+    env_file:
+      - .env
+    environment:
+      - GATEWAY_HOST=0.0.0.0
+      - GATEWAY_PORT=8000
+    # depends_on:
+    #   - engine
+    restart: unless-stopped
+
+  engine:
+    build:
+      context: .
+      dockerfile: docker/inference.dockerfile
+    ports:
+      - "8080:8080"
+    env_file:
+      - .env
+    environment:
+      - ENGINE_HOST=0.0.0.0
+      - ENGINE_PORT=8080
+      - ENGINE_SIDECAR_URL=http://sidecar:8001
+      - ENGINE_MODEL_NAME=arnir0/Tiny-LLM
+      # - ENABLE_ENGINE_MOCK=true
+    volumes:
+      - ./model-store:/mnt/models
+    depends_on:
+      - sidecar
+    restart: unless-stopped
+
+  sidecar:
+    build:
+      context: .
+      dockerfile: docker/sidecar.dockerfile
+    ports:
+      - "8001:8001"
+      - "50051:50051"
+    env_file:
+      - .env
+    environment:
+      - SIDECAR_HOST=0.0.0.0
+      - SIDECAR_PORT=8001
+      # - SIDECAR_ENGINE_URL=http://engine:8080
+      - SIDECAR_INITIAL_MODEL=arnir0/Tiny-LLM
+      - SIDECAR_INITIAL_MODEL_VERSION=main
+      - L2_REDIS_HOST=redis
+      - L2_REDIS_PORT=6379
+    volumes:
+      - ./model-store:/mnt/models
+    depends_on:
+      - redis
+    restart: unless-stopped
+
+  redis:
+    image: redis:7-alpine
+    ports:
+      - "6379:6379"
+    command: redis-server --maxmemory 256mb --maxmemory-policy allkeys-lru
+    volumes:
+      - redis-data:/data
+    restart: unless-stopped
+
+  prometheus:
+    image: prom/prometheus:latest
+    ports:
+      - "9090:9090"
+    volumes:
+      - ./docker/prometheus.yml:/etc/prometheus/prometheus.yml:ro
+    depends_on:
+      - gateway
+      - engine
+      - sidecar
+    restart: unless-stopped
+
+volumes:
+  redis-data:

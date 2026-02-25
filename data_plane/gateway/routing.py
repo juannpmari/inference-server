@@ -4,34 +4,36 @@
 
 
 
+from contextlib import asynccontextmanager
 from fastapi import FastAPI
 from fastapi.exceptions import HTTPException
 import httpx
 from fastapi.responses import JSONResponse
 from http import HTTPStatus
 
-app = FastAPI()
 
-
-# Use the startup event to load ALL necessary models ONCE
-@app.on_event("startup")
-async def startup_event():
-    """
-    # Store the httpx AsyncClient instance in the application state
+@asynccontextmanager
+async def lifespan(app: FastAPI):
+    # Startup: store the httpx AsyncClient instance in the application state
     # Set a reasonable timeout for the *entire* request/response cycle
-    """
-    app.state.http_client = httpx.AsyncClient(timeout=300.0) # 5 minutes
-
-@app.on_event("shutdown")
-async def shutdown_event():
-    """ Cancel the httpx client when the server shuts down"""
+    app.state.http_client = httpx.AsyncClient(timeout=300.0)  # 5 minutes
+    yield
+    # Shutdown: cancel the httpx client when the server shuts down
     await app.state.http_client.aclose()
+
+app = FastAPI(lifespan=lifespan)
+
+
+@app.get("/health")
+async def health():
+    return {"status": "healthy"}
+
 
 # 2. Model-to-Service Mapping (The "Routing Table")
 # In Kubernetes, this is the Service DNS name pointing to the GPU Worker Pod
 MODEL_SERVICE_MAP = {
-    "llama-3-8b": "http://vllm-llama-8b-svc:8000",
-    "mistral-7b": "http://vllm-mistral-7b-svc:8000",
+    "llama-3-8b": "http://engine:8080",
+    # "mistral-7b": "http://vllm-mistral-7b-svc:8000",
 }
 
 

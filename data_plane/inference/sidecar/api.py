@@ -1,83 +1,191 @@
-from fastapi import FastAPI
-from sidecar import ArtifactManager
-from fastapi.exceptions import HTTPException
-from http import HTTPStatus
+import asyncio
+import logging
+import time
+from contextlib import asynccontextmanager
+from typing import Optional
 
-app = FastAPI()
-manager = ArtifactManager()
+from fastapi import FastAPI, HTTPException, status
+from fastapi.responses import JSONResponse, Response
+from prometheus_client import REGISTRY, generate_latest
 
-async def check_initial_model_load():
-    """Performs the loading of the initial model.
-    This logic runs when the sidecar starts. It must be completed before the
-    Inference Manager (Container B) can start its LLMEngine.
-    """
-    try:
-        # Load a default model required by the worker
-        initial_model_path = await manager.load_model(
-            model_identifier="default-llama-3", 
-            version="v1.0"
+from data_plane.inference.sidecar import metrics
+from data_plane.inference.sidecar.artifact_manager import ArtifactManager
+from data_plane.inference.sidecar.config import SidecarConfig
+
+logger = logging.getLogger(__name__)
+
+# Global state
+_manager: Optional[ArtifactManager] = None
+_config: Optional[SidecarConfig] = None
+
+
+@asynccontextmanager
+async def lifespan(app: FastAPI):
+    global _manager, _config
+    logger.info("Starting sidecar...")
+
+    _config = SidecarConfig()
+    _manager = ArtifactManager(config=_config)
+
+    # Load initial model in background
+    _manager.model_registry[_config.initial_model] = {
+        "model_id": _config.initial_model,
+        "version": _config.initial_model_version,
+        "status": "downloading",
+    }
+
+    async def _initial_load():
+        try:
+            path = await _manager.load_model(
+                model_identifier=_config.initial_model,
+                version=_config.initial_model_version,
+            )
+            _manager.is_ready = True
+            metrics.sidecar_resident_models.set(len(_manager.model_registry))
+            logger.info(f"Initial model loaded at {path}")
+        except Exception as e:
+            logger.error(f"Initial model load failed: {e}")
+
+    asyncio.create_task(_initial_load())
+    logger.info("Sidecar startup complete")
+
+    yield
+
+    logger.info("Sidecar shutdown complete")
+
+
+app = FastAPI(title="Sidecar", lifespan=lifespan)
+
+
+@app.get("/health", tags=["health"])
+async def health_check():
+    """Liveness probe."""
+    if _manager is None:
+        return JSONResponse(
+            status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+            content={"status": "initializing"},
         )
-        print(f"Initial model loaded. Path: {initial_model_path}")
-        manager.is_ready = True
-        
-    except Exception as e:
-        print(f"ERROR during initial model load: {e}")
-        # Keep is_ready = False so the K8s probe fails.
-
-# Note: We use the startup event to trigger the initial load.
-@app.on_event("startup")
-async def startup_event():
-    import asyncio
-    # Run the initial model load asynchronously in the background
-    asyncio.create_task(check_initial_model_load())
-
-
-@app.get("/health")
-def health_check():
-    """Standard Liveness Probe."""
     return {"status": "ok"}
 
-@app.get("/ready")
-def readiness_check():
-    """Reports readiness only when the initial model is loaded."""
-    if manager.is_ready:
-        return {"status": "ready", "registry": manager.registry}
-    raise HTTPException(status_code=status.HTTP_503_SERVICE_UNAVAILABLE, detail="Artifact Manager loading initial model.")
 
-@app.post("/load/{model_identifier}")
-async def load_model_route(model_identifier: str, version: str, remote_url: Optional[str] = None):
-    """API to load a specific model version and update the in-memory registry."""
-    
-    try:
-        local_path = await manager.load_model(model_identifier, version)
-        return {"status": "success", "model_identifier": model_identifier, "local_path": local_path}
-    
-    except Exception as e:
-        raise HTTPException(status_code=status.HTTP_500_INTERNAL_SERVER_ERROR, detail=f"Failed to load model: {str(e)}")
+@app.get("/ready", tags=["health"])
+async def readiness_check():
+    """Readiness probe — only ready when initial model is loaded."""
+    if _manager is None or not _manager.is_ready:
+        raise HTTPException(
+            status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+            detail="Artifact Manager loading initial model.",
+        )
+    return {
+        "status": "ready",
+        "resident_models": list(_manager.model_registry.keys()),
+    }
 
-@app.get("/registry")
-def get_registry():
-    """Returns the current state of resident artifacts (models and adapters)."""
-    return {"resident_models": manager.registry, "resident_adapters": manager.adapter_registry}
 
-@app.post("/unload/{model_identifier}")
-def unload_model_route(model_identifier: str):
-    """Removes a model from the registry."""
-    if model_identifier not in manager.registry:
-        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail=f"Model {model_identifier} not resident.")
-        
-    manager.unload_model(model_identifier)
+@app.post("/load/{model_identifier:path}", tags=["models"])
+async def load_model_route(model_identifier: str, version: str = "latest"):
+    """Accept a model load request and process it in the background."""
+    if _manager is None:
+        raise HTTPException(status_code=status.HTTP_503_SERVICE_UNAVAILABLE, detail="Sidecar not initialized")
+
+    # Already loaded — return immediately
+    existing = _manager.model_registry.get(model_identifier)
+    if existing and existing.get("version") == version and existing.get("status") == "loaded":
+        return {"status": "loaded", "model_identifier": model_identifier, "local_path": existing["local_path"]}
+
+    # Already downloading — don't start a second task
+    if existing and existing.get("status") == "downloading":
+        return JSONResponse(
+            status_code=status.HTTP_202_ACCEPTED,
+            content={"status": "downloading", "model_identifier": model_identifier},
+        )
+
+    # Mark as downloading and kick off background task
+    _manager.model_registry[model_identifier] = {
+        "model_id": model_identifier,
+        "version": version,
+        "status": "downloading",
+    }
+
+    async def _background_load():
+        try:
+            start = time.time()
+            local_path = await _manager.load_model(model_identifier, version)
+            duration = time.time() - start
+            metrics.sidecar_model_load_duration_seconds.labels(model=model_identifier, source="huggingface").observe(
+                duration
+            )
+            metrics.sidecar_resident_models.set(len(_manager.model_registry))
+            logger.info(f"Background load complete: {model_identifier} at {local_path}")
+        except Exception as e:
+            logger.error(f"Background load failed for {model_identifier}: {e}")
+            _manager.model_registry.pop(model_identifier, None)
+
+    asyncio.create_task(_background_load())
+
+    return JSONResponse(
+        status_code=status.HTTP_202_ACCEPTED,
+        content={"status": "downloading", "model_identifier": model_identifier},
+    )
+
+
+@app.post("/unload/{model_identifier:path}", tags=["models"])
+async def unload_model_route(model_identifier: str):
+    """Remove a model from the registry."""
+    if _manager is None:
+        raise HTTPException(status_code=status.HTTP_503_SERVICE_UNAVAILABLE, detail="Sidecar not initialized")
+
+    if model_identifier not in _manager.model_registry:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail=f"Model {model_identifier} not resident.",
+        )
+
+    _manager.unload_model(model_identifier)
+    metrics.sidecar_resident_models.set(len(_manager.model_registry))
     return {"status": "success", "model_identifier": model_identifier}
 
-@app.post("/adapter/fetch/{adapter_identifier}")
-async def fetch_adapter_route(adapter_identifier: str, version: str):
-    """
-    API to ensure a LoRA adapter's delta weights are present on the shared disk.
-    Called by the Inference Manager before asking vLLM to load the adapter into VRAM.
-    """
+
+@app.get("/registry/models", tags=["registry"])
+async def get_models():
+    """Returns the current resident models."""
+    if _manager is None:
+        return []
+    return _manager.model_registry
+
+
+@app.get("/registry/adapters", tags=["registry"])
+async def get_adapters():
+    """Returns the current resident adapters."""
+    if _manager is None:
+        return {}
+    return _manager.adapter_registry
+
+
+@app.post("/adapter/fetch/{adapter_identifier:path}", tags=["adapters"])
+async def fetch_adapter_route(adapter_identifier: str, version: str = "latest"):
+    """Ensure a LoRA adapter's files are present on the shared disk."""
+    if _manager is None:
+        raise HTTPException(status_code=status.HTTP_503_SERVICE_UNAVAILABLE, detail="Sidecar not initialized")
+
     try:
-        local_path = await manager.fetch_adapter(adapter_identifier, version)
+        start = time.time()
+        local_path = await _manager.fetch_adapter(adapter_identifier, version)
+        duration = time.time() - start
+
+        metrics.sidecar_adapter_load_duration_seconds.labels(adapter=adapter_identifier).observe(duration)
+        metrics.sidecar_resident_adapters.set(len(_manager.adapter_registry))
+
         return {"status": "success", "adapter_identifier": adapter_identifier, "local_path": local_path}
     except Exception as e:
-        raise HTTPException(status_code=status.HTTP_500_INTERNAL_SERVER_ERROR, detail=f"Failed to fetch adapter: {str(e)}")
-    
+        logger.error(f"Failed to fetch adapter {adapter_identifier}: {e}")
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail=f"Failed to fetch adapter: {str(e)}",
+        )
+
+
+@app.get("/metrics", tags=["monitoring"])
+async def metrics_endpoint():
+    """Prometheus metrics endpoint."""
+    return Response(content=generate_latest(REGISTRY), media_type="text/plain; charset=utf-8")

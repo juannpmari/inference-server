@@ -1,21 +1,24 @@
-from typing import Optional, Dict
-from allocator import L1Allocator, AllocationPointer
-from gpu_transfer import GPUTransferHandler
-from eviction_policies import LRUPolicy
+from typing import Dict
+
+from data_plane.inference.sidecar.l1_cache.allocator import AllocationPointer, L1Allocator
+from data_plane.inference.sidecar.l1_cache.eviction_policy import LRUPolicy
+from data_plane.inference.sidecar.l1_cache.gpu_transfer import GPUTransferHandler
+
 
 class L1CacheAPI:
     """
-    The L1 Facade. 
-    It coordinates the Allocator, Transfer Handler, and Eviction Policy 
+    The L1 Facade.
+    It coordinates the Allocator, Transfer Handler, and Eviction Policy
     to provide simple 'put' and 'get' operations for the Cache Manager.
     """
+
     def __init__(self, capacity_gb: float = 1.0):
         # 1. Initialize Components
         capacity_bytes = int(capacity_gb * 1024**3)
         self.allocator = L1Allocator(capacity_bytes)
         self.transfer = GPUTransferHandler()
         self.eviction_policy = LRUPolicy()
-        
+
         # Internal map: Key -> AllocationPointer
         # Used to find the physical address when given a logical key
         self._key_map: Dict[str, AllocationPointer] = {}
@@ -30,20 +33,20 @@ class L1CacheAPI:
         # 2. If full, run Eviction Loop
         while pointer is None:
             victim_key = self.eviction_policy.select_victim()
-            if not victim_key: 
+            if not victim_key:
                 print("Error: L1 Full and no victims to evict!")
                 return False
-            
+
             # Evict the victim
             print(f"Evicting L1 victim: {victim_key}")
             self._evict_victim(victim_key)
-            
+
             # Retry allocation
             pointer = self.allocator.allocate(size)
 
         # 3. Perform Transfer
         status = await self.transfer.copy_hbm_to_dram(hbm_addr, pointer.cpu_address, size)
-        
+
         if status.success:
             # 4. Update State
             self._key_map[key] = pointer
@@ -64,7 +67,7 @@ class L1CacheAPI:
 
         # 1. Transfer
         status = await self.transfer.copy_dram_to_hbm(pointer.cpu_address, dest_hbm_addr, pointer.size_bytes)
-        
+
         # 2. Update Policy (LRU touch)
         if status.success:
             self.eviction_policy.record_access(key)

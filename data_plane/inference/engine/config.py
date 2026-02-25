@@ -1,8 +1,12 @@
+from pydantic import Field
 from pydantic_settings import BaseSettings
 
 
 class EngineConfig(BaseSettings):
-    model_config = {"env_prefix": "ENGINE_"}
+    model_config = {
+        "env_prefix": "ENGINE_",
+        "populate_by_name": True,
+    }
 
     model_name: str = "Qwen/Qwen2-0.5B"
     max_model_len: int = 512
@@ -11,7 +15,14 @@ class EngineConfig(BaseSettings):
     host: str = "0.0.0.0"
     port: int = 8080
     sidecar_url: str = "http://localhost:8001"
+    sidecar_poll_interval: float = 2.0
+    sidecar_timeout: float = 600.0
     model_path: str = "/models/resident_model"
     enable_lora: bool = False
     max_pending: int = 10
     temperature: float = 0.0
+    enable_engine_mock: bool = Field(
+        default=False,
+        alias="ENABLE_ENGINE_MOCK",
+        description="Set to true to use mock engine (no GPU needed)",
+    )
