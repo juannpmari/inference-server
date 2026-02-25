@@ -16,7 +16,7 @@ except ImportError:
 logger = logging.getLogger(__name__)
 
 class Engine:
-    def __init__(self, config):
+    def __init__(self, config, model_path: str = None):
         if not VLLM_AVAILABLE:
             raise RuntimeError(
                 "vLLM is not installed. Install with: pip install vllm\n"
@@ -33,8 +33,9 @@ class Engine:
         parser = FlexibleArgumentParser()
         parser = EngineArgs.add_cli_args(parser)
 
+        resolved_model = model_path or config.model_name
         cli_args_list = [
-            "--model", config.model_name,
+            "--model", resolved_model,
             "--dtype", config.dtype,
             "--gpu-memory-utilization", str(config.gpu_memory_utilization),
             "--max-model-len", str(config.max_model_len)
@@ -49,7 +50,7 @@ class Engine:
         self.sampling_params = SamplingParams(temperature=config.temperature)
 
         self.engine = LLMEngine.from_engine_args(engine_args)
-        logger.info(f"Engine initialized with model {config.model_name}")
+        logger.info(f"Engine initialized with model {resolved_model}")
 
     async def add_request(
         self,

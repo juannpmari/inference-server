@@ -3,6 +3,7 @@ import logging
 from contextlib import asynccontextmanager
 from typing import Optional
 
+import httpx
 from fastapi import FastAPI, HTTPException, status
 from fastapi.responses import JSONResponse, Response, StreamingResponse
 from pydantic import BaseModel, Field
@@ -37,6 +38,37 @@ _batching_loop = None
 _config = None
 
 
+async def _wait_for_sidecar_model(config: EngineConfig) -> str:
+    """Poll the sidecar registry until the model is loaded, then return its local_path."""
+    url = f"{config.sidecar_url}/registry/models"
+    deadline = time.monotonic() + config.sidecar_timeout
+    logger.info(f"Waiting for sidecar to finish loading model '{config.model_name}'...")
+
+    async with httpx.AsyncClient() as client:
+        while True:
+            try:
+                resp = await client.get(url, timeout=5.0)
+                resp.raise_for_status()
+                registry = resp.json()
+                entry = registry.get(config.model_name)
+                if entry and entry.get("status") == "loaded":
+                    local_path = entry["local_path"]
+                    logger.info(f"Resolved model to local path: {local_path}")
+                    return local_path
+                if entry:
+                    logger.info(f"Model found but status='{entry.get('status')}', waiting...")
+                else:
+                    logger.info("Model not yet in sidecar registry, waiting...")
+            except httpx.RequestError as e:
+                logger.info(f"Sidecar not reachable yet ({e}), waiting...")
+
+            if time.monotonic() >= deadline:
+                raise TimeoutError(
+                    f"Sidecar did not load model '{config.model_name}' within {config.sidecar_timeout}s"
+                )
+            await asyncio.sleep(config.sidecar_poll_interval)
+
+
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     logger.info("Starting engine...")
@@ -51,8 +83,9 @@ async def lifespan(app: FastAPI):
             _engine = MockLLMEngine(_config)
         else:
             logger.info("Using REAL vLLM engine")
+            model_path = await _wait_for_sidecar_model(_config)
             from data_plane.inference.engine.engine import Engine
-            _engine = Engine(_config)
+            _engine = Engine(_config, model_path=model_path)
 
         _batching_loop = asyncio.create_task(_engine.continuous_batching_loop())
         logger.info("Engine startup complete")

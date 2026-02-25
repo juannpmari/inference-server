@@ -25,7 +25,9 @@ services:
     environment:
       - ENGINE_HOST=0.0.0.0
       - ENGINE_PORT=8080
-      - ENABLE_ENGINE_MOCK=true
+      - ENGINE_SIDECAR_URL=http://sidecar:8001
+      - ENGINE_MODEL_NAME=Qwen/Qwen2.5-7B-Instruct-1M
+      # - ENABLE_ENGINE_MOCK=true
     volumes:
       - ./model-store:/mnt/models
     depends_on:
@@ -44,7 +46,9 @@ services:
     environment:
       - SIDECAR_HOST=0.0.0.0
       - SIDECAR_PORT=8001
-      - SIDECAR_ENGINE_URL=http://engine:8080
+      # - SIDECAR_ENGINE_URL=http://engine:8080
+      - SIDECAR_INITIAL_MODEL=Qwen/Qwen2.5-7B-Instruct-1M
+      - SIDECAR_INITIAL_MODEL_VERSION=main
       - L2_REDIS_HOST=redis
       - L2_REDIS_PORT=6379
     volumes:
