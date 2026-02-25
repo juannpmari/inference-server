@@ -28,6 +28,12 @@ async def lifespan(app: FastAPI):
     _manager = ArtifactManager(config=_config)
 
     # Load initial model in background
+    _manager.model_registry[_config.initial_model] = {
+        "model_id": _config.initial_model,
+        "version": _config.initial_model_version,
+        "status": "downloading",
+    }
+
     async def _initial_load():
         try:
             path = await _manager.load_model(
