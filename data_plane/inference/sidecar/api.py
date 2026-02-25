@@ -76,32 +76,54 @@ async def readiness_check():
     }
 
 
-@app.post("/load/{model_identifier}", tags=["models"])
+@app.post("/load/{model_identifier:path}", tags=["models"])
 async def load_model_route(model_identifier: str, version: str = "latest"):
-    """Load a model version and register it."""
+    """Accept a model load request and process it in the background."""
     if _manager is None:
         raise HTTPException(status_code=status.HTTP_503_SERVICE_UNAVAILABLE, detail="Sidecar not initialized")
 
-    try:
-        start = time.time()
-        local_path = await _manager.load_model(model_identifier, version)
-        duration = time.time() - start
+    # Already loaded — return immediately
+    existing = _manager.model_registry.get(model_identifier)
+    if existing and existing.get("version") == version and existing.get("status") == "loaded":
+        return {"status": "loaded", "model_identifier": model_identifier, "local_path": existing["local_path"]}
 
-        metrics.sidecar_model_load_duration_seconds.labels(model=model_identifier, source="huggingface").observe(
-            duration
-        )
-        metrics.sidecar_resident_models.set(len(_manager.model_registry))
-
-        return {"status": "success", "model_identifier": model_identifier, "local_path": local_path}
-    except Exception as e:
-        logger.error(f"Failed to load model {model_identifier}: {e}")
-        raise HTTPException(
-            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
-            detail=f"Failed to load model: {str(e)}",
+    # Already downloading — don't start a second task
+    if existing and existing.get("status") == "downloading":
+        return JSONResponse(
+            status_code=status.HTTP_202_ACCEPTED,
+            content={"status": "downloading", "model_identifier": model_identifier},
         )
 
+    # Mark as downloading and kick off background task
+    _manager.model_registry[model_identifier] = {
+        "model_id": model_identifier,
+        "version": version,
+        "status": "downloading",
+    }
 
-@app.post("/unload/{model_identifier}", tags=["models"])
+    async def _background_load():
+        try:
+            start = time.time()
+            local_path = await _manager.load_model(model_identifier, version)
+            duration = time.time() - start
+            metrics.sidecar_model_load_duration_seconds.labels(model=model_identifier, source="huggingface").observe(
+                duration
+            )
+            metrics.sidecar_resident_models.set(len(_manager.model_registry))
+            logger.info(f"Background load complete: {model_identifier} at {local_path}")
+        except Exception as e:
+            logger.error(f"Background load failed for {model_identifier}: {e}")
+            _manager.model_registry.pop(model_identifier, None)
+
+    asyncio.create_task(_background_load())
+
+    return JSONResponse(
+        status_code=status.HTTP_202_ACCEPTED,
+        content={"status": "downloading", "model_identifier": model_identifier},
+    )
+
+
+@app.post("/unload/{model_identifier:path}", tags=["models"])
 async def unload_model_route(model_identifier: str):
     """Remove a model from the registry."""
     if _manager is None:
@@ -134,7 +156,7 @@ async def get_adapters():
     return _manager.adapter_registry
 
 
-@app.post("/adapter/fetch/{adapter_identifier}", tags=["adapters"])
+@app.post("/adapter/fetch/{adapter_identifier:path}", tags=["adapters"])
 async def fetch_adapter_route(adapter_identifier: str, version: str = "latest"):
     """Ensure a LoRA adapter's files are present on the shared disk."""
     if _manager is None:
