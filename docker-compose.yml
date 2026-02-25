@@ -32,6 +32,13 @@ services:
       - ./model-store:/mnt/models
     depends_on:
       - sidecar
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              count: all
+              capabilities: [gpu]
     restart: unless-stopped
 
   sidecar:
