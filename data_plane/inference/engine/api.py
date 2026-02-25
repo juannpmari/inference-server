@@ -35,6 +35,7 @@ class InferenceResponse(BaseModel):
 # Global state
 _engine = None
 _batching_loop = None
+_init_task = None
 _config = None
 
 
@@ -69,35 +70,46 @@ async def _wait_for_sidecar_model(config: EngineConfig) -> str:
             await asyncio.sleep(config.sidecar_poll_interval)
 
 
-@asynccontextmanager
-async def lifespan(app: FastAPI):
-    logger.info("Starting engine...")
-    # Startup
-    global _engine, _batching_loop, _config
+async def _init_engine(config: EngineConfig):
+    """Background task: wait for sidecar, create engine, start batching loop."""
+    global _engine, _batching_loop
     try:
-        _config = EngineConfig()
-
-        if _config.enable_engine_mock:
+        if config.enable_engine_mock:
             logger.info("Using MOCK engine (no GPU)")
             from data_plane.inference.engine.mock_engine import MockLLMEngine
-            _engine = MockLLMEngine(_config)
+            _engine = MockLLMEngine(config)
         else:
             logger.info("Using REAL vLLM engine")
-            model_path = await _wait_for_sidecar_model(_config)
+            model_path = await _wait_for_sidecar_model(config)
             from data_plane.inference.engine.engine import Engine
-            _engine = Engine(_config, model_path=model_path)
+            _engine = Engine(config, model_path=model_path)
 
         _batching_loop = asyncio.create_task(_engine.continuous_batching_loop())
         logger.info("Engine startup complete")
     except Exception as e:
         logger.error(f"Engine startup failed: {e}")
-        raise
+
+
+@asynccontextmanager
+async def lifespan(app: FastAPI):
+    logger.info("Starting engine...")
+    global _init_task, _config
+    _config = EngineConfig()
+
+    # Launch init in background so the server starts accepting requests immediately
+    _init_task = asyncio.create_task(_init_engine(_config))
 
     yield
 
     # Shutdown
     try:
         logger.info("Shutting down engine...")
+        if _init_task and not _init_task.done():
+            _init_task.cancel()
+            try:
+                await _init_task
+            except asyncio.CancelledError:
+                pass
         if _batching_loop:
             _batching_loop.cancel()
             try:
