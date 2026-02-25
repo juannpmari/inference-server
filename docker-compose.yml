@@ -27,7 +27,7 @@ services:
       - ENGINE_PORT=8080
       - ENABLE_ENGINE_MOCK=true
     volumes:
-      - model-store:/mnt/models
+      - ./model-store:/mnt/models
     depends_on:
       - sidecar
     restart: unless-stopped
@@ -48,7 +48,7 @@ services:
       - L2_REDIS_HOST=redis
       - L2_REDIS_PORT=6379
     volumes:
-      - model-store:/mnt/models
+      - ./model-store:/mnt/models
     depends_on:
       - redis
     restart: unless-stopped
@@ -75,5 +75,4 @@ services:
     restart: unless-stopped
 
 volumes:
-  model-store:
   redis-data:

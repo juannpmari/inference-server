@@ -33,5 +33,7 @@ htmlcov/
 
 # Model artifacts (large files)
 /models/
+/model-store/*
+!/model-store/.gitkeep
 *.bin
 *.safetensors
