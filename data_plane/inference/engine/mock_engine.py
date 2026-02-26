@@ -48,6 +48,22 @@ class MockLLMEngine:
         self.request_futures: Dict[str, asyncio.Future] = {}
         self.pending_requests = {}
         self.finished_requests = []
+
+        # LoRA adapter tracking
+        self.loaded_loras: Dict[int, object] = {}
+        self.lora_load_count: int = 0
+        self.lora_remove_count: int = 0
+
+        # Initialize LoRA manager if enabled
+        self.lora_manager = None
+        if config and getattr(config, "enable_lora", False):
+            from data_plane.inference.engine.lora_manager import LoRAManager
+            self.lora_manager = LoRAManager(
+                engine=self,
+                config=config,
+                sidecar_url=getattr(config, "sidecar_url", "http://localhost:8001"),
+            )
+
         logger.info("MockLLMEngine initialized")
 
     def is_ready(self) -> bool:
@@ -69,6 +85,17 @@ class MockLLMEngine:
 
         future = asyncio.Future()
         self.request_futures[request_id] = future
+
+        # Handle LoRA adapter (same pattern as real Engine)
+        if adapter_identifier and self.lora_manager:
+            try:
+                await self.lora_manager.ensure_adapter_loaded(
+                    adapter_identifier=adapter_identifier,
+                    adapter_version=adapter_version,
+                )
+            except Exception as e:
+                future.set_exception(RuntimeError(f"Failed to load adapter: {e}"))
+                return await future
 
         # Generate deterministic response based on prompt
         response_text = self._generate_mock_response(prompt)
@@ -151,10 +178,22 @@ class MockLLMEngine:
         """Synchronous generation method for simple usage."""
         return self._generate_mock_response(prompt)
 
-    async def add_lora(self, lora_request):
-        """Mock LoRA loading (no-op)"""
-        name = getattr(lora_request, 'lora_name', str(lora_request))
-        logger.info(f"Mock: LoRA adapter {name} loaded")
+    def add_lora(self, lora_request):
+        """Mock LoRA loading — tracks adapter in internal state."""
+        int_id = lora_request.lora_int_id
+        name = lora_request.lora_name
+        self.loaded_loras[int_id] = lora_request
+        self.lora_load_count += 1
+        logger.info(f"Mock: LoRA adapter {name} (id={int_id}) loaded. "
+                     f"Total loaded: {len(self.loaded_loras)}")
+
+    def remove_lora(self, lora_int_id: int):
+        """Mock LoRA removal — removes adapter from internal state."""
+        removed = self.loaded_loras.pop(lora_int_id, None)
+        self.lora_remove_count += 1
+        name = getattr(removed, "lora_name", str(lora_int_id)) if removed else str(lora_int_id)
+        logger.info(f"Mock: LoRA adapter {name} (id={lora_int_id}) removed. "
+                     f"Total loaded: {len(self.loaded_loras)}")
 
     @staticmethod
     def _generate_mock_response(prompt: str) -> str:

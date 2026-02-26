@@ -71,20 +71,20 @@ class TestSidecarHealth:
 class TestSidecarModels:
     """Tests for model load/unload endpoints."""
 
-    def test_load_model_success(self, test_client, mock_manager):
+    def test_load_model_new_returns_202(self, test_client, mock_manager):
         response = test_client.post("/load/new-model?version=latest")
+        assert response.status_code == 202
+        data = response.json()
+        assert data["status"] == "downloading"
+        assert data["model_identifier"] == "new-model"
+
+    def test_load_model_already_loaded_returns_200(self, test_client, mock_manager):
+        """Model already in registry as loaded → 200 with local_path."""
+        response = test_client.post("/load/test-model?version=v1.0")
         assert response.status_code == 200
         data = response.json()
-        assert data["status"] == "success"
-        assert data["model_identifier"] == "new-model"
-        assert data["local_path"] == "/mnt/models/new-model/latest"
-        mock_manager.load_model.assert_called_once_with("new-model", "latest")
-
-    def test_load_model_failure(self, test_client, mock_manager):
-        mock_manager.load_model = AsyncMock(side_effect=RuntimeError("Download failed"))
-        response = test_client.post("/load/bad-model?version=v1")
-        assert response.status_code == 500
-        assert "Failed to load model" in response.json()["detail"]
+        assert data["status"] == "loaded"
+        assert data["local_path"] == "/mnt/models/test-model/v1.0"
 
     def test_unload_model_success(self, test_client, mock_manager):
         response = test_client.post("/unload/test-model")
@@ -114,22 +114,38 @@ class TestSidecarRegistry:
 
 
 class TestSidecarAdapters:
-    """Tests for adapter fetch endpoint."""
+    """Tests for adapter load endpoint (fire-and-forget)."""
 
-    def test_fetch_adapter_success(self, test_client, mock_manager):
-        response = test_client.post("/adapter/fetch/test-adapter?version=v1")
+    def test_load_adapter_new_returns_202(self, test_client, mock_manager):
+        response = test_client.post("/adapter/load/test-adapter?version=v1")
+        assert response.status_code == 202
+        data = response.json()
+        assert data["status"] == "downloading"
+        assert data["adapter_identifier"] == "test-adapter"
+
+    def test_load_adapter_already_loaded_returns_200(self, test_client, mock_manager):
+        mock_manager.adapter_registry["test-adapter"] = {
+            "adapter_id": "test-adapter",
+            "version": "v1",
+            "local_path": "/mnt/models/test-adapter/v1",
+            "status": "loaded",
+        }
+        response = test_client.post("/adapter/load/test-adapter?version=v1")
         assert response.status_code == 200
         data = response.json()
-        assert data["status"] == "success"
-        assert data["adapter_identifier"] == "test-adapter"
-        assert data["local_path"] == "/mnt/models/adapter/latest"
-        mock_manager.fetch_adapter.assert_called_once_with("test-adapter", "v1")
+        assert data["status"] == "loaded"
+        assert data["local_path"] == "/mnt/models/test-adapter/v1"
 
-    def test_fetch_adapter_failure(self, test_client, mock_manager):
-        mock_manager.fetch_adapter = AsyncMock(side_effect=RuntimeError("Not found"))
-        response = test_client.post("/adapter/fetch/bad-adapter?version=v1")
-        assert response.status_code == 500
-        assert "Failed to fetch adapter" in response.json()["detail"]
+    def test_load_adapter_already_downloading_returns_202(self, test_client, mock_manager):
+        mock_manager.adapter_registry["test-adapter"] = {
+            "adapter_id": "test-adapter",
+            "version": "v1",
+            "status": "downloading",
+        }
+        response = test_client.post("/adapter/load/test-adapter?version=v1")
+        assert response.status_code == 202
+        data = response.json()
+        assert data["status"] == "downloading"
 
 
 class TestSidecarMetrics:
