@@ -154,6 +154,23 @@ async def get_models():
     return _manager.model_registry
 
 
+@app.post("/adapter/unload/{adapter_identifier:path}", tags=["adapters"])
+async def unload_adapter_route(adapter_identifier: str):
+    """Remove an adapter from the registry."""
+    if _manager is None:
+        raise HTTPException(status_code=status.HTTP_503_SERVICE_UNAVAILABLE, detail="Sidecar not initialized")
+
+    if adapter_identifier not in _manager.adapter_registry:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail=f"Adapter {adapter_identifier} not resident.",
+        )
+
+    _manager.unload_adapter(adapter_identifier)
+    metrics.sidecar_resident_adapters.set(len(_manager.adapter_registry))
+    return {"status": "success", "adapter_identifier": adapter_identifier}
+
+
 @app.get("/registry/adapters", tags=["registry"])
 async def get_adapters():
     """Returns the current resident adapters."""
@@ -162,27 +179,51 @@ async def get_adapters():
     return _manager.adapter_registry
 
 
-@app.post("/adapter/fetch/{adapter_identifier:path}", tags=["adapters"])
-async def fetch_adapter_route(adapter_identifier: str, version: str = "latest"):
-    """Ensure a LoRA adapter's files are present on the shared disk."""
+@app.post("/adapter/load/{adapter_identifier:path}", tags=["adapters"])
+async def load_adapter_route(adapter_identifier: str, version: str = "latest"):
+    """Trigger a LoRA adapter download (fire-and-forget, returns 202).
+
+    Poll GET /registry/adapters to check when status becomes "loaded".
+    """
     if _manager is None:
         raise HTTPException(status_code=status.HTTP_503_SERVICE_UNAVAILABLE, detail="Sidecar not initialized")
 
-    try:
-        start = time.time()
-        local_path = await _manager.fetch_adapter(adapter_identifier, version)
-        duration = time.time() - start
+    # Already loaded — return immediately
+    existing = _manager.adapter_registry.get(adapter_identifier)
+    if existing and existing.get("version") == version and existing.get("status") == "loaded":
+        return {"status": "loaded", "adapter_identifier": adapter_identifier, "local_path": existing["local_path"]}
 
-        metrics.sidecar_adapter_load_duration_seconds.labels(adapter=adapter_identifier).observe(duration)
-        metrics.sidecar_resident_adapters.set(len(_manager.adapter_registry))
-
-        return {"status": "success", "adapter_identifier": adapter_identifier, "local_path": local_path}
-    except Exception as e:
-        logger.error(f"Failed to fetch adapter {adapter_identifier}: {e}")
-        raise HTTPException(
-            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
-            detail=f"Failed to fetch adapter: {str(e)}",
+    # Already downloading — don't start a second task
+    if existing and existing.get("status") == "downloading":
+        return JSONResponse(
+            status_code=status.HTTP_202_ACCEPTED,
+            content={"status": "downloading", "adapter_identifier": adapter_identifier},
         )
+
+    # Mark as downloading and kick off background task
+    _manager.adapter_registry[adapter_identifier] = {
+        "adapter_id": adapter_identifier,
+        "version": version,
+        "status": "downloading",
+    }
+
+    async def _background_fetch():
+        try:
+            start = time.time()
+            local_path = await _manager.fetch_adapter(adapter_identifier, version)
+            duration = time.time() - start
+            metrics.sidecar_adapter_load_duration_seconds.labels(adapter=adapter_identifier).observe(duration)
+            metrics.sidecar_resident_adapters.set(len(_manager.adapter_registry))
+            logger.info(f"Background adapter fetch complete: {adapter_identifier} at {local_path}")
+        except Exception as e:
+            logger.error(f"Background adapter fetch failed for {adapter_identifier}: {e}")
+
+    asyncio.create_task(_background_fetch())
+
+    return JSONResponse(
+        status_code=status.HTTP_202_ACCEPTED,
+        content={"status": "downloading", "adapter_identifier": adapter_identifier},
+    )
 
 
 @app.get("/metrics", tags=["monitoring"])

@@ -28,6 +28,7 @@ services:
       - ENGINE_SIDECAR_URL=http://sidecar:8001
       - ENGINE_MODEL_NAME=arnir0/Tiny-LLM
       # - ENABLE_ENGINE_MOCK=true
+      - ENGINE_ENABLE_LORA=true
     volumes:
       - ./model-store:/mnt/models
     depends_on:

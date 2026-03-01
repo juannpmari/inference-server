@@ -19,6 +19,10 @@ class EngineConfig(BaseSettings):
     sidecar_timeout: float = 600.0
     model_path: str = "/models/resident_model"
     enable_lora: bool = False
+    max_loras: int = 4
+    max_lora_rank: int = 16
+    adapter_poll_interval: float = 1.0
+    adapter_poll_timeout: float = 600.0
     max_pending: int = 10
     temperature: float = 0.0
     enable_engine_mock: bool = Field(

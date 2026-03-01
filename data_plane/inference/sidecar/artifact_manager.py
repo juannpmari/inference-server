@@ -127,14 +127,36 @@ class ArtifactManager:
             self._persist_registry()
             logger.info(f"Model {model_identifier} unloaded from registry.")
 
+    def unload_adapter(self, adapter_identifier: str):
+        """Removes the adapter from the registry."""
+        if adapter_identifier in self.adapter_registry:
+            del self.adapter_registry[adapter_identifier]
+            self._persist_registry()
+            logger.info(f"Adapter {adapter_identifier} unloaded from registry.")
+
     async def fetch_adapter(self, adapter_identifier: str, version: str = "latest") -> str:
-        """Downloads the adapter if necessary and registers it as resident."""
-        local_path = await self._fetch_from_external_storage("adapter", adapter_identifier, version)
-        self.adapter_registry[adapter_identifier] = {
-            "adapter_id": adapter_identifier,
-            "version": version,
-            "local_path": local_path,
-            "status": "loaded",
-        }
-        self._persist_registry()
-        return local_path
+        """Downloads the adapter if necessary and registers it as resident.
+
+        Updates adapter_registry status: "downloading" -> "loaded" (or removes on failure).
+        Caller should set status to "downloading" before calling if using fire-and-forget pattern.
+        """
+        existing = self.adapter_registry.get(adapter_identifier)
+        if existing and existing.get("version") == version and existing.get("status") == "loaded":
+            logger.info(f"Adapter {adapter_identifier} v{version} already resident.")
+            return existing["local_path"]
+
+        try:
+            local_path = await self._fetch_from_external_storage("adapter", adapter_identifier, version)
+            self.adapter_registry[adapter_identifier] = {
+                "adapter_id": adapter_identifier,
+                "version": version,
+                "local_path": local_path,
+                "status": "loaded",
+            }
+            self._persist_registry()
+            return local_path
+        except Exception:
+            # Remove failed entry so it can be retried
+            self.adapter_registry.pop(adapter_identifier, None)
+            self._persist_registry()
+            raise
