@@ -154,6 +154,23 @@ async def get_models():
     return _manager.model_registry
 
 
+@app.post("/adapter/unload/{adapter_identifier:path}", tags=["adapters"])
+async def unload_adapter_route(adapter_identifier: str):
+    """Remove an adapter from the registry."""
+    if _manager is None:
+        raise HTTPException(status_code=status.HTTP_503_SERVICE_UNAVAILABLE, detail="Sidecar not initialized")
+
+    if adapter_identifier not in _manager.adapter_registry:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail=f"Adapter {adapter_identifier} not resident.",
+        )
+
+    _manager.unload_adapter(adapter_identifier)
+    metrics.sidecar_resident_adapters.set(len(_manager.adapter_registry))
+    return {"status": "success", "adapter_identifier": adapter_identifier}
+
+
 @app.get("/registry/adapters", tags=["registry"])
 async def get_adapters():
     """Returns the current resident adapters."""

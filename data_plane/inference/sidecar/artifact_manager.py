@@ -127,6 +127,13 @@ class ArtifactManager:
             self._persist_registry()
             logger.info(f"Model {model_identifier} unloaded from registry.")
 
+    def unload_adapter(self, adapter_identifier: str):
+        """Removes the adapter from the registry."""
+        if adapter_identifier in self.adapter_registry:
+            del self.adapter_registry[adapter_identifier]
+            self._persist_registry()
+            logger.info(f"Adapter {adapter_identifier} unloaded from registry.")
+
     async def fetch_adapter(self, adapter_identifier: str, version: str = "latest") -> str:
         """Downloads the adapter if necessary and registers it as resident.
 
