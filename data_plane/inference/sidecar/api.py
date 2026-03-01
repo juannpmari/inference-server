@@ -4,28 +4,31 @@ import time
 from contextlib import asynccontextmanager
 from typing import Optional
 
-from fastapi import FastAPI, HTTPException, status
+from fastapi import FastAPI, HTTPException, Query, status
 from fastapi.responses import JSONResponse, Response
 from prometheus_client import REGISTRY, generate_latest
 
 from data_plane.inference.sidecar import metrics
 from data_plane.inference.sidecar.artifact_manager import ArtifactManager
 from data_plane.inference.sidecar.config import SidecarConfig
+from data_plane.inference.sidecar.kv_block_registry import KVBlockRegistry
 
 logger = logging.getLogger(__name__)
 
 # Global state
 _manager: Optional[ArtifactManager] = None
 _config: Optional[SidecarConfig] = None
+_kv_registry: Optional[KVBlockRegistry] = None
 
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
-    global _manager, _config
+    global _manager, _config, _kv_registry
     logger.info("Starting sidecar...")
 
     _config = SidecarConfig()
     _manager = ArtifactManager(config=_config)
+    _kv_registry = KVBlockRegistry()
 
     # Load initial model in background
     _manager.model_registry[_config.initial_model] = {
@@ -230,3 +233,37 @@ async def load_adapter_route(adapter_identifier: str, version: str = "latest"):
 async def metrics_endpoint():
     """Prometheus metrics endpoint."""
     return Response(content=generate_latest(REGISTRY), media_type="text/plain; charset=utf-8")
+
+
+# --- Cache endpoints (for cache-aware routing in Phase J) ---
+
+
+@app.get("/cache/blocks", tags=["cache"])
+async def get_cache_blocks(
+    prefix_hash: Optional[str] = Query(None),
+    model_id: Optional[str] = Query(None),
+):
+    """List cached KV blocks, optionally filtered by prefix_hash and model_id."""
+    if _kv_registry is None:
+        return []
+    if prefix_hash:
+        entries = _kv_registry.query_by_prefix(prefix_hash, model_id or "")
+    else:
+        entries = _kv_registry.all_entries()
+    return [e.to_dict() for e in entries]
+
+
+@app.get("/cache/stats", tags=["cache"])
+async def get_cache_stats():
+    """Summary statistics for cache state (used by routing and observability)."""
+    if _kv_registry is None:
+        return {
+            "total_blocks": 0,
+            "l1_blocks": 0,
+            "l2_blocks": 0,
+            "l1_used_bytes": 0,
+            "l2_used_bytes": 0,
+            "hit_rate": 0.0,
+            "eviction_count": 0,
+        }
+    return _kv_registry.stats()

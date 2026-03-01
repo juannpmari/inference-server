@@ -7,6 +7,8 @@ import asyncio
 import logging
 from typing import Dict, List, Optional
 
+from shared.types import BlockReference, TransferResult
+
 logger = logging.getLogger(__name__)
 
 # Deterministic mock responses based on prompt
@@ -53,6 +55,9 @@ class MockLLMEngine:
         self.loaded_loras: Dict[int, object] = {}
         self.lora_load_count: int = 0
         self.lora_remove_count: int = 0
+
+        # Cache client for KV block offload/fetch
+        self.cache_client = None
 
         # Initialize LoRA manager if enabled
         self.lora_manager = None
@@ -194,6 +199,34 @@ class MockLLMEngine:
         name = getattr(removed, "lora_name", str(lora_int_id)) if removed else str(lora_int_id)
         logger.info(f"Mock: LoRA adapter {name} (id={lora_int_id}) removed. "
                      f"Total loaded: {len(self.loaded_loras)}")
+
+    def set_cache_client(self, client) -> None:
+        """Attach a SidecarCacheClient for KV block operations."""
+        self.cache_client = client
+        logger.info("Cache client attached to MockEngine")
+
+    async def offload_block(
+        self,
+        key: str,
+        size: int,
+        model_id: str = "",
+        prefix_hash: str = "",
+    ) -> TransferResult:
+        """Simulate what vLLM's OffloadingConnector would do: offload a KV block."""
+        if not self.cache_client:
+            return TransferResult(False, "No cache client configured")
+        # In mock mode, use a fake HBM address
+        block_ref = BlockReference(device_id=0, memory_address=0xDEAD_0000, size_bytes=size)
+        return await self.cache_client.offload_block(
+            key, block_ref, model_id=model_id, prefix_hash=prefix_hash
+        )
+
+    async def fetch_block(self, key: str, size: int = 4096) -> TransferResult:
+        """Simulate fetching a cached KV block back into HBM."""
+        if not self.cache_client:
+            return TransferResult(False, "No cache client configured")
+        dest_ref = BlockReference(device_id=0, memory_address=0xBEEF_0000, size_bytes=size)
+        return await self.cache_client.fetch_block(key, dest_ref)
 
     @staticmethod
     def _generate_mock_response(prompt: str) -> str:

@@ -25,6 +25,7 @@ class EngineConfig(BaseSettings):
     adapter_poll_timeout: float = 600.0
     max_pending: int = 10
     temperature: float = 0.0
+    sidecar_grpc_url: str = "localhost:50051"
     enable_engine_mock: bool = Field(
         default=False,
         alias="ENABLE_ENGINE_MOCK",
