@@ -15,4 +15,5 @@ class SidecarConfig(BaseSettings):
     grpc_port: int = 50051
     initial_model: str = "arnir0/Tiny-LLM"
     initial_model_version: str = "main"
+    model_store_path: str = "/mnt/models"
     registry_path: str = "/mnt/models/registry.json"
