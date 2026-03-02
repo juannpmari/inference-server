@@ -1,107 +1,116 @@
-"""Client for calling the sidecar's KV cache gRPC service from the engine.
+"""gRPC client for the sidecar's KV cache service.
 
-In production, vLLM's OffloadingConnector would call these methods. In mock mode,
-MockEngine calls them directly to simulate the offload/fetch flow.
+Used by the engine (both MockEngine and vLLM OffloadingHandler) to store/load
+KV block bytes over gRPC to the sidecar container.
 """
 
 import logging
-from dataclasses import dataclass
 from typing import Optional
 
-from shared.types import BlockReference, TransferResult
+import grpc
+
+from shared.proto import kv_cache_pb2, kv_cache_pb2_grpc
 
 logger = logging.getLogger(__name__)
 
+# 16 MB max message size
+_MAX_MESSAGE_SIZE = 16 * 1024 * 1024
 
-@dataclass
-class OffloadRequest:
-    """Request payload for offloading a KV block."""
-    key: str
-    device_id: int
-    memory_address: int
-    size_bytes: int
-    model_id: str = ""
-    prefix_hash: str = ""
-
-
-@dataclass
-class FetchRequest:
-    """Request payload for fetching a KV block back to HBM."""
-    key: str
-    dest_device_id: int
-    dest_memory_address: int
-    dest_size_bytes: int
-
-
-@dataclass
-class SpaceRequest:
-    """Request payload for L1 eviction."""
-    needed_size_bytes: int
+_GRPC_OPTIONS = [
+    ("grpc.max_send_message_length", _MAX_MESSAGE_SIZE),
+    ("grpc.max_receive_message_length", _MAX_MESSAGE_SIZE),
+]
 
 
 class SidecarCacheClient:
-    """Wraps gRPC calls to the sidecar's KVCacheAPIService.
+    """Async gRPC client wrapping KVCacheService RPCs."""
 
-    In the current implementation, this client holds a direct reference to the
-    KVCacheAPIService for in-process communication (engine and sidecar co-located
-    in the same pod). A future version can replace this with actual gRPC stubs.
-    """
-
-    def __init__(self, kv_service=None, grpc_url: str = "localhost:50051"):
-        self._service = kv_service
+    def __init__(self, grpc_url: str = "localhost:50051"):
         self._grpc_url = grpc_url
+        self._channel = grpc.aio.insecure_channel(grpc_url, options=_GRPC_OPTIONS)
+        self._stub = kv_cache_pb2_grpc.KVCacheServiceStub(self._channel)
         logger.info(f"SidecarCacheClient initialized (grpc_url={grpc_url})")
 
-    async def offload_block(
+    async def store_block(
         self,
-        key: str,
-        block_ref: BlockReference,
+        block_id: int,
+        block_hash: str,
+        data: bytes,
         model_id: str = "",
-        prefix_hash: str = "",
-    ) -> TransferResult:
-        """Ask sidecar to offload a KV block from HBM."""
-        if not self._service:
-            return TransferResult(False, "No KV cache service configured")
-
-        request = OffloadRequest(
-            key=key,
-            device_id=block_ref.device_id,
-            memory_address=block_ref.memory_address,
-            size_bytes=block_ref.size_bytes,
-            model_id=model_id,
-            prefix_hash=prefix_hash,
-        )
-        return await self._service.OffloadKVBlock(request, context=None)
-
-    async def fetch_block(self, key: str, dest_ref: BlockReference) -> TransferResult:
-        """Ask sidecar to fetch a KV block back into HBM."""
-        if not self._service:
-            return TransferResult(False, "No KV cache service configured")
-
-        request = FetchRequest(
-            key=key,
-            dest_device_id=dest_ref.device_id,
-            dest_memory_address=dest_ref.memory_address,
-            dest_size_bytes=dest_ref.size_bytes,
-        )
-        return await self._service.FetchKVBlock(request, context=None)
-
-    async def check_availability(self, key: str) -> bool:
-        """Check if a key exists in any cache tier."""
-        if not self._service:
+        layer_name: str = "",
+    ) -> bool:
+        """Send block bytes to sidecar for storage."""
+        try:
+            resp = await self._stub.StoreBlock(
+                kv_cache_pb2.StoreBlockRequest(
+                    block_id=block_id,
+                    block_hash=block_hash,
+                    data=data,
+                    model_id=model_id,
+                    layer_name=layer_name,
+                ),
+                timeout=5.0,
+            )
+            return resp.success
+        except grpc.RpcError as e:
+            logger.error(f"StoreBlock RPC failed: {e}")
             return False
 
-        @dataclass
-        class _Req:
-            key: str
+    async def load_block(self, block_id: int, layer_name: str = "") -> Optional[bytes]:
+        """Request block bytes from sidecar."""
+        try:
+            resp = await self._stub.LoadBlock(
+                kv_cache_pb2.LoadBlockRequest(
+                    block_id=block_id,
+                    layer_name=layer_name,
+                ),
+                timeout=5.0,
+            )
+            if resp.success:
+                return resp.data
+            return None
+        except grpc.RpcError as e:
+            logger.error(f"LoadBlock RPC failed: {e}")
+            return None
 
-        return await self._service.QueryAvailability(_Req(key=key), context=None)
+    async def get_free_blocks(self) -> int:
+        """Query available capacity."""
+        try:
+            resp = await self._stub.GetFreeBlocks(
+                kv_cache_pb2.GetFreeBlocksRequest(),
+                timeout=5.0,
+            )
+            return resp.num_free_blocks
+        except grpc.RpcError as e:
+            logger.error(f"GetFreeBlocks RPC failed: {e}")
+            return 0
 
-    async def request_l1_space(self, needed_bytes: int) -> TransferResult:
-        """Force L1 eviction to free space."""
-        if not self._service:
-            return TransferResult(False, "No KV cache service configured")
+    async def allocate_blocks(self, block_hashes: list[str]) -> Optional[list[int]]:
+        """Reserve block slots by hash."""
+        try:
+            resp = await self._stub.AllocateBlocks(
+                kv_cache_pb2.AllocateBlocksRequest(block_hashes=block_hashes),
+                timeout=5.0,
+            )
+            if resp.success:
+                return list(resp.block_ids)
+            return None
+        except grpc.RpcError as e:
+            logger.error(f"AllocateBlocks RPC failed: {e}")
+            return None
 
-        return await self._service.RequestL1Space(
-            SpaceRequest(needed_size_bytes=needed_bytes), context=None
-        )
+    async def free_block(self, block_id: int) -> bool:
+        """Release a block slot."""
+        try:
+            resp = await self._stub.FreeBlock(
+                kv_cache_pb2.FreeBlockRequest(block_id=block_id),
+                timeout=5.0,
+            )
+            return resp.success
+        except grpc.RpcError as e:
+            logger.error(f"FreeBlock RPC failed: {e}")
+            return False
+
+    async def close(self):
+        """Close the gRPC channel."""
+        await self._channel.close()

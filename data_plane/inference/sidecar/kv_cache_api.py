@@ -1,58 +1,86 @@
-"""gRPC service handler for KV Cache operations.
+"""gRPC servicer for KV Cache operations.
 
-Receives requests from the engine and delegates to MultiTieredCacheManager.
+Implements kv_cache.KVCacheService as a real gRPC servicer.
+Each RPC method delegates to MultiTieredCacheManager.
 """
 
 import logging
-from typing import Any
+
+import grpc
 
 from data_plane.inference.sidecar.cache_manager import MultiTieredCacheManager
-from shared.types import BlockReference, TransferResult
+from shared.proto import kv_cache_pb2, kv_cache_pb2_grpc
 
 logger = logging.getLogger(__name__)
 
 
-class KVCacheAPIService:
-    """gRPC service exposing cache offload/fetch/query/eviction operations."""
+class KVCacheServicer(kv_cache_pb2_grpc.KVCacheServiceServicer):
+    """gRPC servicer exposing cache store/load/allocate/free operations."""
 
     def __init__(self, cache_manager: MultiTieredCacheManager):
         self._manager = cache_manager
-        logger.info("KV Cache API Service initialized")
+        logger.info("KVCacheServicer initialized")
 
-    async def OffloadKVBlock(self, request: Any, context: Any) -> TransferResult:
-        """Offload a KV block from GPU HBM to the cache hierarchy."""
+    async def StoreBlock(self, request, context):
         try:
-            key = request.key
-            block_ref = BlockReference(
-                device_id=request.device_id,
-                memory_address=request.memory_address,
-                size_bytes=request.size_bytes,
+            ok = await self._manager.store_block(
+                block_id=request.block_id,
+                block_hash=request.block_hash,
+                data=request.data,
+                model_id=request.model_id,
+                layer_name=request.layer_name,
             )
-            model_id = getattr(request, "model_id", "")
-            prefix_hash = getattr(request, "prefix_hash", "")
-            return await self._manager.process_offload(
-                block_ref, key, model_id=model_id, prefix_hash=prefix_hash
+            return kv_cache_pb2.StoreBlockResponse(
+                success=ok,
+                message="stored" if ok else "store failed",
             )
         except Exception as e:
-            return TransferResult(success=False, message=f"Offload failed: {e}")
+            logger.error(f"StoreBlock error: {e}")
+            return kv_cache_pb2.StoreBlockResponse(success=False, message=str(e))
 
-    async def FetchKVBlock(self, request: Any, context: Any) -> TransferResult:
-        """Fetch a KV block back into GPU HBM."""
+    async def LoadBlock(self, request, context):
         try:
-            key = request.key
-            dest_ref = BlockReference(
-                device_id=request.dest_device_id,
-                memory_address=request.dest_memory_address,
-                size_bytes=request.dest_size_bytes,
+            data = await self._manager.load_block(request.block_id)
+            if data is not None:
+                return kv_cache_pb2.LoadBlockResponse(
+                    success=True, data=data, message="loaded"
+                )
+            return kv_cache_pb2.LoadBlockResponse(
+                success=False, data=b"", message="block not found"
             )
-            return await self._manager.execute_fetch(key, dest_ref)
         except Exception as e:
-            return TransferResult(success=False, message=f"Fetch failed: {e}")
+            logger.error(f"LoadBlock error: {e}")
+            return kv_cache_pb2.LoadBlockResponse(
+                success=False, data=b"", message=str(e)
+            )
 
-    async def QueryAvailability(self, request: Any, context: Any) -> bool:
-        """Check if a key exists in any cache tier."""
-        return await self._manager.check_global_availability(request.key)
+    async def GetFreeBlocks(self, request, context):
+        num_free = self._manager.get_num_free_blocks()
+        return kv_cache_pb2.GetFreeBlocksResponse(num_free_blocks=num_free)
 
-    async def RequestL1Space(self, request: Any, context: Any) -> TransferResult:
-        """Force L1 eviction to free requested bytes."""
-        return await self._manager.execute_l1_eviction(request.needed_size_bytes)
+    async def AllocateBlocks(self, request, context):
+        try:
+            ids = self._manager.allocate_blocks(list(request.block_hashes))
+            if ids is not None:
+                return kv_cache_pb2.AllocateBlocksResponse(
+                    success=True, block_ids=ids, message="allocated"
+                )
+            return kv_cache_pb2.AllocateBlocksResponse(
+                success=False, block_ids=[], message="insufficient capacity"
+            )
+        except Exception as e:
+            logger.error(f"AllocateBlocks error: {e}")
+            return kv_cache_pb2.AllocateBlocksResponse(
+                success=False, block_ids=[], message=str(e)
+            )
+
+    async def FreeBlock(self, request, context):
+        try:
+            ok = self._manager.free_block(request.block_id)
+            return kv_cache_pb2.FreeBlockResponse(
+                success=ok,
+                message="freed" if ok else "block not found",
+            )
+        except Exception as e:
+            logger.error(f"FreeBlock error: {e}")
+            return kv_cache_pb2.FreeBlockResponse(success=False, message=str(e))

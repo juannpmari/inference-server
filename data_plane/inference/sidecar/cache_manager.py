@@ -1,10 +1,8 @@
-"""Multi-tiered cache manager orchestrating L1 and L2 tiers.
+"""Multi-tiered cache manager orchestrating L1 byte store and L2.
 
-Implements the offload/fetch strategy:
-  1. Try L1 (fast, local CPU DRAM)
-  2. Fall back to L2 (slower, distributed Redis)
-
-Integrates with KVBlockRegistry for metadata tracking.
+Accepts raw bytes (not GPU addresses). The engine serializes tensors to bytes,
+sends them over gRPC, and this manager stores them in L1 (fast, local) with
+optional L2 fallback (slower, distributed Redis).
 """
 
 import logging
@@ -12,109 +10,68 @@ import time
 from typing import Optional
 
 from data_plane.inference.sidecar.kv_block_registry import KVBlockRegistry
-from data_plane.inference.sidecar.l1_cache.api import L1CacheAPI
+from data_plane.inference.sidecar.l1_cache.api import L1ByteStore
 from data_plane.inference.sidecar.l2_cache.connector import L2Connector
-from shared.types import BlockReference, KVBlockEntry, TransferResult
+from shared.types import KVBlockEntry
 
 logger = logging.getLogger(__name__)
 
 
 class MultiTieredCacheManager:
-    """Orchestrates L1 ↔ L2 cache operations with registry tracking."""
+    """Orchestrates L1 byte store + L2 with registry tracking."""
 
     def __init__(
         self,
-        l1_api: L1CacheAPI,
-        l2_connector: L2Connector,
+        l1: L1ByteStore,
+        l2: L2Connector,
         registry: Optional[KVBlockRegistry] = None,
     ):
-        self.l1 = l1_api
-        self.l2 = l2_connector
+        self.l1 = l1
+        self.l2 = l2
         self.registry = registry or KVBlockRegistry()
 
-    async def process_offload(
+    def get_num_free_blocks(self) -> int:
+        return self.l1.get_num_free_blocks()
+
+    def allocate_blocks(self, block_hashes: list[str]) -> Optional[list[int]]:
+        """Allocate block slots in L1. Returns block IDs or None if insufficient space."""
+        return self.l1.allocate_blocks(block_hashes)
+
+    async def store_block(
         self,
-        block_ref: BlockReference,
-        key: str,
+        block_id: int,
+        block_hash: str,
+        data: bytes,
         model_id: str = "",
-        prefix_hash: str = "",
-    ) -> TransferResult:
-        """Offload a KV block: try L1 first, fall back to L2."""
-        logger.debug(f"Processing offload for key: {key}")
-
-        l1_success = await self.l1.put(key, block_ref.memory_address, block_ref.size_bytes)
-
-        if l1_success:
+        layer_name: str = "",
+    ) -> bool:
+        """Store block bytes in L1, register in metadata."""
+        ok = self.l1.store(block_id, data, block_hash)
+        if ok:
             self.registry.register(KVBlockEntry(
-                key=key,
+                key=block_hash,
                 location="L1",
-                size_bytes=block_ref.size_bytes,
-                l1_address=block_ref.memory_address,
+                size_bytes=len(data),
                 model_id=model_id,
-                prefix_hash=prefix_hash,
+                prefix_hash=block_hash,
                 created_at=time.time(),
                 last_accessed=time.time(),
             ))
-            return TransferResult(True, "Offloaded to L1")
+        return ok
 
-        logger.info(f"L1 failed for {key}, promoting to L2")
-        mock_data = b"\x00" * block_ref.size_bytes
-        l2_status = await self.l2.put(key, mock_data)
+    async def load_block(self, block_id: int) -> Optional[bytes]:
+        """Load block bytes from L1. Returns None on miss."""
+        data = self.l1.load(block_id)
+        if data is not None:
+            block_hash = self.l1._id_to_hash.get(block_id)
+            if block_hash:
+                self.registry.record_access(block_hash)
+        return data
 
-        if l2_status.success:
-            self.registry.register(KVBlockEntry(
-                key=key,
-                location="L2",
-                size_bytes=block_ref.size_bytes,
-                model_id=model_id,
-                prefix_hash=prefix_hash,
-                created_at=time.time(),
-                last_accessed=time.time(),
-            ))
-
-        return TransferResult(l2_status.success, f"Promoted to L2: {l2_status.message}")
-
-    async def execute_fetch(self, key: str, dest_ref: BlockReference) -> TransferResult:
-        """Fetch a KV block: check L1, then L2."""
-        l1_success = await self.l1.get(key, dest_ref.memory_address)
-        if l1_success:
-            self.registry.record_access(key)
-            return TransferResult(True, "Hit in L1")
-
-        l2_status = await self.l2.get(key)
-        if l2_status.success and l2_status.data:
-            self.registry.record_access(key)
-            return TransferResult(True, "Hit in L2 (Restored to HBM)")
-
-        return TransferResult(False, "Cache Miss (Key not found in L1 or L2)")
-
-    async def check_global_availability(self, key: str) -> bool:
-        """Check if a block exists in any tier via the registry."""
-        entry = self.registry.lookup(key)
-        return entry is not None
-
-    async def execute_l1_eviction(self, needed_bytes: int) -> TransferResult:
-        """Evict LRU entries from L1 until needed_bytes are freed."""
-        freed = 0
-        evicted_keys = []
-
-        while freed < needed_bytes:
-            victim_key = self.l1.eviction_policy.select_victim()
-            if not victim_key:
-                break
-            pointer = self.l1._key_map.get(victim_key)
-            if pointer:
-                freed += pointer.size_bytes
-            self.l1._evict_victim(victim_key)
-            self.registry.unregister(victim_key)
-            evicted_keys.append(victim_key)
-
-        if freed >= needed_bytes:
-            return TransferResult(
-                True, f"Freed {freed} bytes by evicting {len(evicted_keys)} blocks"
-            )
-        return TransferResult(
-            False,
-            f"Could only free {freed}/{needed_bytes} bytes "
-            f"(evicted {len(evicted_keys)} blocks)",
-        )
+    def free_block(self, block_id: int) -> bool:
+        """Free a block slot and unregister from metadata."""
+        block_hash = self.l1._id_to_hash.get(block_id)
+        result = self.l1.free(block_id)
+        if result and block_hash:
+            self.registry.unregister(block_hash)
+        return result

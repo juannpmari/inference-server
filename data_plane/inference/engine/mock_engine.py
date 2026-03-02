@@ -5,9 +5,9 @@ Provides a deterministic mock implementation with the same interface as the real
 
 import asyncio
 import logging
-from typing import Dict, List, Optional
+from typing import Dict, Optional
 
-from shared.types import BlockReference, TransferResult
+from data_plane.inference.engine.sidecar_cache_client import SidecarCacheClient
 
 logger = logging.getLogger(__name__)
 
@@ -56,8 +56,12 @@ class MockLLMEngine:
         self.lora_load_count: int = 0
         self.lora_remove_count: int = 0
 
-        # Cache client for KV block offload/fetch
-        self.cache_client = None
+        # Cache client for KV block offload/fetch (created from config or set later)
+        self.cache_client: Optional[SidecarCacheClient] = None
+        if config and getattr(config, "sidecar_grpc_url", None):
+            self.cache_client = SidecarCacheClient(
+                grpc_url=config.sidecar_grpc_url,
+            )
 
         # Initialize LoRA manager if enabled
         self.lora_manager = None
@@ -200,33 +204,33 @@ class MockLLMEngine:
         logger.info(f"Mock: LoRA adapter {name} (id={lora_int_id}) removed. "
                      f"Total loaded: {len(self.loaded_loras)}")
 
-    def set_cache_client(self, client) -> None:
-        """Attach a SidecarCacheClient for KV block operations."""
-        self.cache_client = client
-        logger.info("Cache client attached to MockEngine")
-
     async def offload_block(
         self,
-        key: str,
-        size: int,
+        block_hash: str,
+        data: bytes,
         model_id: str = "",
-        prefix_hash: str = "",
-    ) -> TransferResult:
-        """Simulate what vLLM's OffloadingConnector would do: offload a KV block."""
+    ) -> bool:
+        """Simulate what vLLM's OffloadingConnector would do: offload a KV block via gRPC."""
         if not self.cache_client:
-            return TransferResult(False, "No cache client configured")
-        # In mock mode, use a fake HBM address
-        block_ref = BlockReference(device_id=0, memory_address=0xDEAD_0000, size_bytes=size)
-        return await self.cache_client.offload_block(
-            key, block_ref, model_id=model_id, prefix_hash=prefix_hash
+            return False
+
+        # Allocate a slot, store data
+        ids = await self.cache_client.allocate_blocks([block_hash])
+        if ids is None:
+            return False
+        block_id = ids[0]
+        return await self.cache_client.store_block(
+            block_id=block_id,
+            block_hash=block_hash,
+            data=data,
+            model_id=model_id,
         )
 
-    async def fetch_block(self, key: str, size: int = 4096) -> TransferResult:
-        """Simulate fetching a cached KV block back into HBM."""
+    async def fetch_block(self, block_hash: str, block_id: int) -> Optional[bytes]:
+        """Fetch a cached KV block back via gRPC."""
         if not self.cache_client:
-            return TransferResult(False, "No cache client configured")
-        dest_ref = BlockReference(device_id=0, memory_address=0xBEEF_0000, size_bytes=size)
-        return await self.cache_client.fetch_block(key, dest_ref)
+            return None
+        return await self.cache_client.load_block(block_id)
 
     @staticmethod
     def _generate_mock_response(prompt: str) -> str:

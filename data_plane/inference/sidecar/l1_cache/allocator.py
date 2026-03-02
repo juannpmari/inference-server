@@ -1,107 +1,60 @@
-"""L1 Cache memory allocator with free-list reclamation.
+"""Block slot allocator for L1 byte store.
 
-Manages a fixed-size pool of CPU DRAM. Tracks allocations with a sorted
-free-list so that free() reclaims specific regions and subsequent allocations
-can reuse them (first-fit strategy).
+Manages a fixed number of block slots identified by integer IDs.
+No memory addresses, no coalescing — just a free-list of block IDs.
 """
 
-import bisect
 import logging
-from typing import List, Optional, Tuple
-
-from shared.types import AllocationPointer
+from typing import Optional
 
 logger = logging.getLogger(__name__)
 
-# Base address for simulated memory pool
-_POOL_BASE = 0x1000_0000
 
+class BlockSlotAllocator:
+    """Fixed-capacity allocator tracking block IDs with a free-list."""
 
-class L1Allocator:
-    """Fixed-size CPU DRAM allocator with free-list reclamation."""
-
-    def __init__(self, capacity_bytes: int, mock: bool = True):
-        self._capacity = capacity_bytes
-        self._mock = mock
-        self._used = 0
-        # Free-list: sorted list of (offset, size) tuples representing free regions
-        self._free_list: List[Tuple[int, int]] = [(0, capacity_bytes)]
-        # Active allocations: offset -> size
-        self._allocations: dict[int, int] = {}
-        logger.debug(f"L1 Allocator initialized: {capacity_bytes} bytes (mock={mock})")
+    def __init__(self, num_blocks: int):
+        self._num_blocks = num_blocks
+        self._free_ids: list[int] = list(range(num_blocks))
+        self._allocated: set[int] = set()
+        logger.debug(f"BlockSlotAllocator initialized: {num_blocks} slots")
 
     @property
-    def capacity_bytes(self) -> int:
-        return self._capacity
+    def num_blocks(self) -> int:
+        return self._num_blocks
 
     @property
-    def available_bytes(self) -> int:
-        return self._capacity - self._used
+    def num_free(self) -> int:
+        return len(self._free_ids)
 
     @property
-    def used_bytes(self) -> int:
-        return self._used
+    def num_allocated(self) -> int:
+        return len(self._allocated)
 
-    @property
-    def allocation_count(self) -> int:
-        return len(self._allocations)
-
-    def allocate(self, size_bytes: int) -> Optional[AllocationPointer]:
-        """First-fit allocation from the free-list. Returns None if no space."""
-        if size_bytes <= 0:
+    def allocate(self) -> Optional[int]:
+        """Allocate a single block slot. Returns block_id or None if full."""
+        if not self._free_ids:
             return None
+        block_id = self._free_ids.pop()
+        self._allocated.add(block_id)
+        return block_id
 
-        for i, (offset, region_size) in enumerate(self._free_list):
-            if region_size >= size_bytes:
-                # Found a fit — remove or shrink the free region
-                if region_size == size_bytes:
-                    self._free_list.pop(i)
-                else:
-                    self._free_list[i] = (offset + size_bytes, region_size - size_bytes)
+    def allocate_n(self, n: int) -> Optional[list[int]]:
+        """Allocate n block slots. Returns list of IDs or None if not enough free."""
+        if len(self._free_ids) < n:
+            return None
+        ids = [self._free_ids.pop() for _ in range(n)]
+        self._allocated.update(ids)
+        return ids
 
-                self._used += size_bytes
-                self._allocations[offset] = size_bytes
-                address = _POOL_BASE + offset
-                return AllocationPointer(cpu_address=address, size_bytes=size_bytes)
-
-        return None  # No contiguous region large enough
-
-    def free(self, ptr: AllocationPointer) -> bool:
-        """Return an allocation to the free-list with coalescing."""
-        offset = ptr.cpu_address - _POOL_BASE
-        if offset not in self._allocations:
-            logger.warning(f"Double-free or invalid pointer: {hex(ptr.cpu_address)}")
+    def free(self, block_id: int) -> bool:
+        """Return a block slot to the free-list."""
+        if block_id not in self._allocated:
+            logger.warning(f"Double-free or invalid block_id: {block_id}")
             return False
-
-        size = self._allocations.pop(offset)
-        self._used -= size
-
-        # Insert into sorted free-list and coalesce adjacent regions
-        new_region = (offset, size)
-        insert_idx = bisect.bisect_left(self._free_list, new_region)
-        self._free_list.insert(insert_idx, new_region)
-        self._coalesce(insert_idx)
+        self._allocated.discard(block_id)
+        self._free_ids.append(block_id)
         return True
 
-    def _coalesce(self, idx: int) -> None:
-        """Merge adjacent free regions around the given index."""
-        # Merge with right neighbor
-        while idx + 1 < len(self._free_list):
-            curr_offset, curr_size = self._free_list[idx]
-            next_offset, next_size = self._free_list[idx + 1]
-            if curr_offset + curr_size == next_offset:
-                self._free_list[idx] = (curr_offset, curr_size + next_size)
-                self._free_list.pop(idx + 1)
-            else:
-                break
-
-        # Merge with left neighbor
-        while idx > 0:
-            prev_offset, prev_size = self._free_list[idx - 1]
-            curr_offset, curr_size = self._free_list[idx]
-            if prev_offset + prev_size == curr_offset:
-                self._free_list[idx - 1] = (prev_offset, prev_size + curr_size)
-                self._free_list.pop(idx)
-                idx -= 1
-            else:
-                break
+    def is_allocated(self, block_id: int) -> bool:
+        return block_id in self._allocated

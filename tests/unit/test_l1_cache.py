@@ -1,4 +1,4 @@
-"""Unit tests for L1 cache components: allocator, LRU policy, L1CacheAPI, KVBlockRegistry."""
+"""Unit tests for L1 byte store, block slot allocator, LRU policy, and KVBlockRegistry."""
 
 import json
 import os
@@ -6,56 +6,56 @@ import tempfile
 
 import pytest
 
-from data_plane.inference.sidecar.l1_cache.allocator import L1Allocator
-from data_plane.inference.sidecar.l1_cache.api import L1CacheAPI
+from data_plane.inference.sidecar.l1_cache.allocator import BlockSlotAllocator
+from data_plane.inference.sidecar.l1_cache.api import L1ByteStore
 from data_plane.inference.sidecar.l1_cache.eviction_policy import LRUPolicy
-from data_plane.inference.sidecar.l1_cache.gpu_transfer import (
-    MockGPUTransferHandler,
-    create_transfer_handler,
-)
 from data_plane.inference.sidecar.kv_block_registry import KVBlockRegistry
 from shared.types import KVBlockEntry
 
 
-# --- Allocator tests ---
+# --- BlockSlotAllocator tests ---
 
 
-class TestL1Allocator:
-    def test_alloc_free_cycle(self):
-        alloc = L1Allocator(capacity_bytes=1024, mock=True)
-        ptr = alloc.allocate(256)
-        assert ptr is not None
-        assert ptr.size_bytes == 256
-        assert alloc.used_bytes == 256
-        assert alloc.available_bytes == 768
+class TestBlockSlotAllocator:
+    def test_allocate_free_cycle(self):
+        alloc = BlockSlotAllocator(num_blocks=4)
+        bid = alloc.allocate()
+        assert bid is not None
+        assert alloc.num_allocated == 1
+        assert alloc.num_free == 3
 
-        assert alloc.free(ptr) is True
-        assert alloc.used_bytes == 0
-        assert alloc.available_bytes == 1024
+        assert alloc.free(bid) is True
+        assert alloc.num_allocated == 0
+        assert alloc.num_free == 4
 
     def test_capacity_exhaustion(self):
-        alloc = L1Allocator(capacity_bytes=512, mock=True)
-        ptr1 = alloc.allocate(300)
-        assert ptr1 is not None
-        ptr2 = alloc.allocate(300)
-        assert ptr2 is None  # Not enough space
-        assert alloc.used_bytes == 300
+        alloc = BlockSlotAllocator(num_blocks=2)
+        id1 = alloc.allocate()
+        id2 = alloc.allocate()
+        assert id1 is not None and id2 is not None
+        assert alloc.num_free == 0
 
-    def test_free_list_reclamation(self):
-        """After freeing A, a new allocation C should fit in A's space."""
-        alloc = L1Allocator(capacity_bytes=1024, mock=True)
-        ptr_a = alloc.allocate(256)
-        ptr_b = alloc.allocate(256)
-        assert ptr_a is not None and ptr_b is not None
+        id3 = alloc.allocate()
+        assert id3 is None
 
-        alloc.free(ptr_a)
-        assert alloc.available_bytes == 768
+    def test_allocate_n(self):
+        alloc = BlockSlotAllocator(num_blocks=4)
+        ids = alloc.allocate_n(3)
+        assert ids is not None
+        assert len(ids) == 3
+        assert alloc.num_free == 1
 
-        # C should reuse A's freed region
-        ptr_c = alloc.allocate(256)
-        assert ptr_c is not None
-        assert ptr_c.cpu_address == ptr_a.cpu_address  # Same address reused
-        assert alloc.used_bytes == 512
+        # Not enough for 2 more
+        assert alloc.allocate_n(2) is None
+
+    def test_free_reuses_id(self):
+        alloc = BlockSlotAllocator(num_blocks=2)
+        id1 = alloc.allocate()
+        id2 = alloc.allocate()
+        alloc.free(id1)
+
+        id3 = alloc.allocate()
+        assert id3 == id1  # reuses freed ID
 
 
 # --- LRU Policy tests ---
@@ -87,56 +87,66 @@ class TestLRUPolicy:
         assert lru.select_victim() is None
 
 
-# --- L1CacheAPI tests ---
+# --- L1ByteStore tests ---
 
 
-class TestL1CacheAPI:
+class TestL1ByteStore:
     @pytest.fixture
-    def l1(self):
-        return L1CacheAPI(capacity_bytes=1024, mock=True)
+    def store(self):
+        return L1ByteStore(num_blocks=4, block_size_bytes=64)
 
-    @pytest.mark.asyncio
-    async def test_put_get_roundtrip(self, l1):
-        ok = await l1.put("block-1", hbm_addr=0xAAAA, size=256)
-        assert ok is True
-        assert l1.has_key("block-1")
+    def test_store_load_roundtrip(self, store):
+        ids = store.allocate_blocks(["hash-1"])
+        assert ids is not None
+        block_id = ids[0]
 
-        hit = await l1.get("block-1", dest_hbm_addr=0xBBBB)
-        assert hit is True
+        data = b"hello world" + b"\x00" * 53  # 64 bytes
+        assert store.store(block_id, data, "hash-1") is True
 
-    @pytest.mark.asyncio
-    async def test_eviction_on_capacity_pressure(self, l1):
-        await l1.put("a", 0x1000, 400)
-        await l1.put("b", 0x2000, 400)
-        # L1 has 1024 bytes, 800 used. Putting 300 more should evict 'a' (LRU)
-        ok = await l1.put("c", 0x3000, 300)
-        assert ok is True
-        assert not l1.has_key("a")  # evicted
-        assert l1.has_key("b")
-        assert l1.has_key("c")
+        loaded = store.load(block_id)
+        assert loaded == data
 
-    @pytest.mark.asyncio
-    async def test_get_miss_returns_false(self, l1):
-        hit = await l1.get("nonexistent", dest_hbm_addr=0x9999)
-        assert hit is False
+    def test_capacity_exhaustion(self, store):
+        hashes = [f"h{i}" for i in range(4)]
+        ids = store.allocate_blocks(hashes)
+        assert ids is not None
+        # Store data so LRU tracks them for eviction
+        for bid, h in zip(ids, hashes):
+            store.store(bid, b"\x00" * 64, h)
+        assert store.get_num_free_blocks() == 0
 
+        # Eviction should free a slot
+        assert store.allocate_blocks(["extra"]) is not None
 
-# --- GPU Transfer Handler tests ---
+    def test_eviction_frees_lru(self, store):
+        # Fill all 4 blocks
+        hashes = [f"h{i}" for i in range(4)]
+        ids = store.allocate_blocks(hashes)
+        for bid, h in zip(ids, hashes):
+            store.store(bid, b"\x00" * 64, h)
 
+        assert store.get_num_free_blocks() == 0
 
-class TestGPUTransferHandler:
-    def test_factory_returns_mock(self):
-        handler = create_transfer_handler(mock=True)
-        assert isinstance(handler, MockGPUTransferHandler)
+        # Allocate one more — should evict LRU
+        new_ids = store.allocate_blocks(["h-new"])
+        assert new_ids is not None
+        assert store.get_num_free_blocks() == 0  # used the freed slot
 
-    @pytest.mark.asyncio
-    async def test_mock_handler_success(self):
-        handler = MockGPUTransferHandler()
-        status = await handler.copy_hbm_to_dram(0x1000, 0x2000, 512)
-        assert status.success is True
+    def test_allocate_free_cycle(self, store):
+        ids = store.allocate_blocks(["hash-a"])
+        assert ids is not None
+        bid = ids[0]
 
-        status = await handler.copy_dram_to_hbm(0x2000, 0x1000, 512)
-        assert status.success is True
+        store.store(bid, b"\x00" * 64, "hash-a")
+        assert store.free(bid) is True
+        assert store.get_num_free_blocks() == 4
+
+        # Reuse the freed slot
+        ids2 = store.allocate_blocks(["hash-b"])
+        assert ids2 is not None
+
+    def test_load_miss(self, store):
+        assert store.load(999) is None
 
 
 # --- KV Block Registry tests ---

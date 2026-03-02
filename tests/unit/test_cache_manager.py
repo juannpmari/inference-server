@@ -1,17 +1,14 @@
-"""Unit tests for MultiTieredCacheManager, REST cache endpoints, and engine wiring."""
+"""Unit tests for byte-oriented MultiTieredCacheManager and REST cache endpoints."""
 
-from unittest.mock import AsyncMock, MagicMock
+from unittest.mock import AsyncMock
 
 import pytest
 from httpx import ASGITransport, AsyncClient
 
 from data_plane.inference.sidecar.cache_manager import MultiTieredCacheManager
 from data_plane.inference.sidecar.kv_block_registry import KVBlockRegistry
-from data_plane.inference.sidecar.kv_cache_api import KVCacheAPIService
-from data_plane.inference.sidecar.l1_cache.api import L1CacheAPI
-from data_plane.inference.engine.mock_engine import MockLLMEngine
-from data_plane.inference.engine.sidecar_cache_client import SidecarCacheClient
-from shared.types import BlockReference, TransferResult
+from data_plane.inference.sidecar.l1_cache.api import L1ByteStore
+from shared.types import TransferResult
 
 
 @pytest.fixture
@@ -29,81 +26,67 @@ def registry():
 
 @pytest.fixture
 def l1():
-    return L1CacheAPI(capacity_bytes=2048, mock=True)
+    return L1ByteStore(num_blocks=8, block_size_bytes=64)
 
 
 @pytest.fixture
 def manager(l1, mock_l2, registry):
-    return MultiTieredCacheManager(l1_api=l1, l2_connector=mock_l2, registry=registry)
-
-
-# --- Cache Manager tests ---
+    return MultiTieredCacheManager(l1=l1, l2=mock_l2, registry=registry)
 
 
 class TestMultiTieredCacheManager:
     @pytest.mark.asyncio
-    async def test_offload_stores_in_l1_and_registers(self, manager, registry):
-        ref = BlockReference(device_id=0, memory_address=0x1000, size_bytes=256)
-        result = await manager.process_offload(ref, "key-1", model_id="m1", prefix_hash="ph1")
+    async def test_store_and_load_bytes(self, manager, registry):
+        ids = manager.allocate_blocks(["hash-1"])
+        assert ids is not None
+        block_id = ids[0]
 
-        assert result.success is True
-        assert "L1" in result.message
-        entry = registry.lookup("key-1")
+        data = b"test-data" + b"\x00" * 55  # 64 bytes
+        ok = await manager.store_block(block_id, "hash-1", data, model_id="m1")
+        assert ok is True
+
+        entry = registry.lookup("hash-1")
         assert entry is not None
         assert entry.location == "L1"
         assert entry.model_id == "m1"
 
-    @pytest.mark.asyncio
-    async def test_fetch_hits_l1_and_updates_access(self, manager, registry):
-        ref = BlockReference(device_id=0, memory_address=0x1000, size_bytes=256)
-        await manager.process_offload(ref, "key-2")
-
-        dest = BlockReference(device_id=0, memory_address=0x2000, size_bytes=256)
-        result = await manager.execute_fetch("key-2", dest)
-        assert result.success is True
-        assert "L1" in result.message
-
-        entry = registry.lookup("key-2")
-        assert entry is not None
-        assert entry.access_count >= 1
+        loaded = await manager.load_block(block_id)
+        assert loaded == data
 
     @pytest.mark.asyncio
-    async def test_fetch_misses_l1_falls_to_l2(self, manager, mock_l2):
-        dest = BlockReference(device_id=0, memory_address=0x3000, size_bytes=128)
-        result = await manager.execute_fetch("missing-key", dest)
-        assert result.success is False
-        assert "Miss" in result.message
-        mock_l2.get.assert_called_once_with("missing-key")
+    async def test_load_miss(self, manager):
+        result = await manager.load_block(999)
+        assert result is None
 
     @pytest.mark.asyncio
-    async def test_check_global_availability(self, manager):
-        ref = BlockReference(device_id=0, memory_address=0x1000, size_bytes=128)
-        await manager.process_offload(ref, "avail-key")
+    async def test_free_block(self, manager, registry):
+        ids = manager.allocate_blocks(["free-hash"])
+        assert ids is not None
+        block_id = ids[0]
 
-        assert await manager.check_global_availability("avail-key") is True
-        assert await manager.check_global_availability("nope") is False
+        data = b"\x01" * 64
+        await manager.store_block(block_id, "free-hash", data)
 
-    @pytest.mark.asyncio
-    async def test_execute_l1_eviction(self, manager, registry):
-        ref = BlockReference(device_id=0, memory_address=0x1000, size_bytes=512)
-        await manager.process_offload(ref, "evict-a")
-        await manager.process_offload(
-            BlockReference(0, 0x2000, 512), "evict-b"
-        )
+        ok = manager.free_block(block_id)
+        assert ok is True
+        assert registry.lookup("free-hash") is None
 
-        result = await manager.execute_l1_eviction(600)
-        assert result.success is True
-        assert registry.lookup("evict-a") is None  # evicted (LRU)
+        # Slot should be returned to pool
+        assert manager.get_num_free_blocks() == 8
 
     @pytest.mark.asyncio
-    async def test_l1_full_triggers_eviction_still_succeeds(self, manager):
-        # Fill L1 (2048 bytes)
-        await manager.process_offload(BlockReference(0, 0x1000, 1024), "fill-a")
-        await manager.process_offload(BlockReference(0, 0x2000, 1024), "fill-b")
+    async def test_get_num_free_blocks(self, manager):
+        assert manager.get_num_free_blocks() == 8
 
-        # This should trigger eviction of fill-a and succeed
-        result = await manager.process_offload(BlockReference(0, 0x3000, 512), "fill-c")
-        assert result.success is True
+        manager.allocate_blocks(["h1", "h2"])
+        assert manager.get_num_free_blocks() == 6
+
+    @pytest.mark.asyncio
+    async def test_allocate_blocks_returns_ids(self, manager):
+        ids = manager.allocate_blocks(["a", "b", "c"])
+        assert ids is not None
+        assert len(ids) == 3
+        assert len(set(ids)) == 3  # all unique
 
 
 # --- REST endpoint tests ---
@@ -132,45 +115,3 @@ class TestCacheRESTEndpoints:
             assert "total_blocks" in body
             assert "hit_rate" in body
             assert "l1_blocks" in body
-
-
-# --- Engine wiring tests ---
-
-
-class TestSidecarCacheClient:
-    @pytest.mark.asyncio
-    async def test_offload_via_client(self, manager):
-        service = KVCacheAPIService(cache_manager=manager)
-        client = SidecarCacheClient(kv_service=service)
-
-        ref = BlockReference(device_id=0, memory_address=0x5000, size_bytes=128)
-        result = await client.offload_block("wired-key", ref, model_id="m")
-        assert result.success is True
-
-    @pytest.mark.asyncio
-    async def test_fetch_roundtrip_via_client(self, manager):
-        service = KVCacheAPIService(cache_manager=manager)
-        client = SidecarCacheClient(kv_service=service)
-
-        # Offload first
-        ref = BlockReference(device_id=0, memory_address=0x5000, size_bytes=128)
-        await client.offload_block("rt-key", ref)
-
-        # Fetch back
-        dest = BlockReference(device_id=0, memory_address=0x6000, size_bytes=128)
-        result = await client.fetch_block("rt-key", dest)
-        assert result.success is True
-
-    @pytest.mark.asyncio
-    async def test_mock_engine_offload(self, manager):
-        service = KVCacheAPIService(cache_manager=manager)
-        client = SidecarCacheClient(kv_service=service)
-
-        engine = MockLLMEngine()
-        engine.set_cache_client(client)
-
-        result = await engine.offload_block("engine-blk", size=256, model_id="test")
-        assert result.success is True
-
-        result = await engine.fetch_block("engine-blk", size=256)
-        assert result.success is True

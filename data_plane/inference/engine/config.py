@@ -26,6 +26,8 @@ class EngineConfig(BaseSettings):
     max_pending: int = 10
     temperature: float = 0.0
     sidecar_grpc_url: str = "localhost:50051"
+    enable_kv_offload: bool = False
+    kv_offload_num_blocks: int = 1024
     enable_engine_mock: bool = Field(
         default=False,
         alias="ENABLE_ENGINE_MOCK",

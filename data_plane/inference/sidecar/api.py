@@ -19,16 +19,31 @@ logger = logging.getLogger(__name__)
 _manager: Optional[ArtifactManager] = None
 _config: Optional[SidecarConfig] = None
 _kv_registry: Optional[KVBlockRegistry] = None
+_grpc_server = None
 
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
-    global _manager, _config, _kv_registry
+    global _manager, _config, _kv_registry, _grpc_server
     logger.info("Starting sidecar...")
 
     _config = SidecarConfig()
     _manager = ArtifactManager(config=_config)
     _kv_registry = KVBlockRegistry()
+
+    # Start gRPC KV cache server
+    from data_plane.inference.sidecar.cache_manager import MultiTieredCacheManager
+    from data_plane.inference.sidecar.grpc_server import create_grpc_server
+    from data_plane.inference.sidecar.l1_cache.api import L1ByteStore
+    from data_plane.inference.sidecar.l2_cache.connector import L2Connector
+
+    l1_store = L1ByteStore(
+        num_blocks=_config.l1_num_blocks,
+        block_size_bytes=_config.l1_block_size_bytes,
+    )
+    l2 = L2Connector()
+    cache_manager = MultiTieredCacheManager(l1=l1_store, l2=l2, registry=_kv_registry)
+    _grpc_server = await create_grpc_server(cache_manager, port=_config.grpc_port)
 
     # Load initial model in background
     _manager.model_registry[_config.initial_model] = {
@@ -54,6 +69,9 @@ async def lifespan(app: FastAPI):
 
     yield
 
+    if _grpc_server is not None:
+        await _grpc_server.stop(grace=5)
+        logger.info("gRPC server stopped")
     logger.info("Sidecar shutdown complete")
 
 

@@ -17,3 +17,5 @@ class SidecarConfig(BaseSettings):
     initial_model_version: str = "main"
     model_store_path: str = "/mnt/models"
     registry_path: str = "/mnt/models/registry.json"
+    l1_num_blocks: int = 1024
+    l1_block_size_bytes: int = 131072  # 128 KB
