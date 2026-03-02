@@ -1,5 +1,6 @@
 from typing import Dict, List, Any, Optional
 import asyncio
+import json
 import logging
 
 try:
@@ -46,6 +47,20 @@ class Engine:
                 "--enable-lora",
                 "--max-loras", str(config.max_loras),
                 "--max-lora-rank", str(config.max_lora_rank),
+            ])
+
+        if config.enable_kv_offload:
+            cli_args_list.extend([
+                "--kv-transfer-config", json.dumps({
+                    "kv_connector": "OffloadingConnector",
+                    "kv_role": "kv_both",
+                    "kv_connector_extra_config": {
+                        "spec_name": "SidecarOffloadingSpec",
+                        "spec_module_path": "data_plane.inference.engine.kv_offload.sidecar_spec",
+                        "sidecar_grpc_url": config.sidecar_grpc_url,
+                        "num_blocks": config.kv_offload_num_blocks,
+                    },
+                }),
             ])
 
         args = parser.parse_args(cli_args_list)

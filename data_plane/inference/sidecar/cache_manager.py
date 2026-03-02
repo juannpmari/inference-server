@@ -1,86 +1,77 @@
+"""Multi-tiered cache manager orchestrating L1 byte store and L2.
+
+Accepts raw bytes (not GPU addresses). The engine serializes tensors to bytes,
+sends them over gRPC, and this manager stores them in L1 (fast, local) with
+optional L2 fallback (slower, distributed Redis).
+"""
+
 import logging
-from typing import NamedTuple
+import time
+from typing import Optional
 
-from data_plane.inference.sidecar.l1_cache.api import L1CacheAPI
+from data_plane.inference.sidecar.kv_block_registry import KVBlockRegistry
+from data_plane.inference.sidecar.l1_cache.api import L1ByteStore
 from data_plane.inference.sidecar.l2_cache.connector import L2Connector
+from shared.types import KVBlockEntry
 
-
-# Re-using definitions from previous steps
-class BlockReference(NamedTuple):
-    device_id: int
-    memory_address: int
-    size_bytes: int
-
-
-class Status(NamedTuple):
-    success: bool
-    message: str
+logger = logging.getLogger(__name__)
 
 
 class MultiTieredCacheManager:
-    """
-    The 'Brain' of the Sidecar.
-    Implements the Dynamic Balancing Logic between L1 and L2.
-    """
+    """Orchestrates L1 byte store + L2 with registry tracking."""
 
-    def __init__(self, l1_api: L1CacheAPI, l2_connector: L2Connector):
-        self.l1 = l1_api
-        self.l2 = l2_connector
+    def __init__(
+        self,
+        l1: L1ByteStore,
+        l2: L2Connector,
+        registry: Optional[KVBlockRegistry] = None,
+    ):
+        self.l1 = l1
+        self.l2 = l2
+        self.registry = registry or KVBlockRegistry()
 
-    async def process_offload(self, block_ref: BlockReference, key: str) -> Status:
-        """
-        STRATEGY:
-        1. Try to put in L1 (Fastest).
-        2. If L1 is full/fails, promote to L2 (Persistence/Sharing).
-        """
-        logging.debug(f"Processing offload for key: {key}")
+    def get_num_free_blocks(self) -> int:
+        return self.l1.get_num_free_blocks()
 
-        # Tier 1: Try L1 Offload (Local RAM)
-        # Note: L1 API handles the HBM -> DRAM transfer internally
-        l1_success = await self.l1.put(key, block_ref.memory_address, block_ref.size_bytes)
+    def allocate_blocks(self, block_hashes: list[str]) -> Optional[list[int]]:
+        """Allocate block slots in L1. Returns block IDs or None if insufficient space."""
+        return self.l1.allocate_blocks(block_hashes)
 
-        if l1_success:
-            return Status(True, "Offloaded to L1")
+    async def store_block(
+        self,
+        block_id: int,
+        block_hash: str,
+        data: bytes,
+        model_id: str = "",
+        layer_name: str = "",
+    ) -> bool:
+        """Store block bytes in L1, register in metadata."""
+        ok = self.l1.store(block_id, data, block_hash)
+        if ok:
+            self.registry.register(KVBlockEntry(
+                key=block_hash,
+                location="L1",
+                size_bytes=len(data),
+                model_id=model_id,
+                prefix_hash=block_hash,
+                created_at=time.time(),
+                last_accessed=time.time(),
+            ))
+        return ok
 
-        # Tier 2: L1 failed (Full & Eviction didn't help), so go to L2 (Remote Redis)
-        logging.info(f"L1 Full/Failed for {key}. Promoting to L2...")
+    async def load_block(self, block_id: int) -> Optional[bytes]:
+        """Load block bytes from L1. Returns None on miss."""
+        data = self.l1.load(block_id)
+        if data is not None:
+            block_hash = self.l1._id_to_hash.get(block_id)
+            if block_hash:
+                self.registry.record_access(block_hash)
+        return data
 
-        # For L2, we first need to pull the data from GPU to a temporary buffer
-        # (In a real implementation, you might stream this directly)
-        # For this prototype, we assume we have a way to get the bytes:
-        # data_bytes = await gpu_transfer.read_gpu_memory(block_ref) <--- Conceptual helper
-
-        # MOCKING the data read for the prototype
-        mock_data = b"\x00" * block_ref.size_bytes
-
-        l2_status = await self.l2.put(key, mock_data)
-        return Status(l2_status.success, f"Promoted to L2: {l2_status.message}")
-
-    async def execute_fetch(self, key: str, dest_ref: BlockReference) -> Status:
-        """
-        STRATEGY:
-        1. Check L1.
-        2. If Miss, Check L2.
-        """
-        # Tier 1: Check L1
-        l1_success = await self.l1.get(key, dest_ref.memory_address)
-        if l1_success:
-            return Status(True, "Hit in L1")
-
-        # Tier 2: Check L2
-        l2_status = await self.l2.get(key)
-        if l2_status.success and l2_status.data:
-            # We got the data bytes from Redis. Now we must load them into GPU HBM.
-            # We use the L1 API's transfer handler (or a dedicated one) to write to HBM.
-            # await gpu_transfer.write_to_hbm(dest_ref.memory_address, l2_status.data)
-            return Status(True, "Hit in L2 (Restored to HBM)")
-
-        return Status(False, "Cache Miss (Key not found in L1 or L2)")
-
-    async def check_global_availability(self, key: str) -> bool:
-        """Queries the L1 and L2 Meta Service for the key's presence."""
-        raise NotImplementedError
-
-    async def execute_l1_eviction(self, needed_size: int) -> Status:
-        """Triggers the L1 eviction policy to free up space in CPU DRAM."""
-        raise NotImplementedError
+    def free_block(self, block_id: int) -> bool:
+        """Free a block slot and unregister from metadata."""
+        block_hash = self.l1._id_to_hash.get(block_id)
+        result = self.l1.free(block_id)
+        if result and block_hash:
+            self.registry.unregister(block_hash)
+        return result

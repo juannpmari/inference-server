@@ -5,7 +5,9 @@ Provides a deterministic mock implementation with the same interface as the real
 
 import asyncio
 import logging
-from typing import Dict, List, Optional
+from typing import Dict, Optional
+
+from data_plane.inference.engine.sidecar_cache_client import SidecarCacheClient
 
 logger = logging.getLogger(__name__)
 
@@ -53,6 +55,13 @@ class MockLLMEngine:
         self.loaded_loras: Dict[int, object] = {}
         self.lora_load_count: int = 0
         self.lora_remove_count: int = 0
+
+        # Cache client for KV block offload/fetch (created from config or set later)
+        self.cache_client: Optional[SidecarCacheClient] = None
+        if config and getattr(config, "sidecar_grpc_url", None):
+            self.cache_client = SidecarCacheClient(
+                grpc_url=config.sidecar_grpc_url,
+            )
 
         # Initialize LoRA manager if enabled
         self.lora_manager = None
@@ -194,6 +203,34 @@ class MockLLMEngine:
         name = getattr(removed, "lora_name", str(lora_int_id)) if removed else str(lora_int_id)
         logger.info(f"Mock: LoRA adapter {name} (id={lora_int_id}) removed. "
                      f"Total loaded: {len(self.loaded_loras)}")
+
+    async def offload_block(
+        self,
+        block_hash: str,
+        data: bytes,
+        model_id: str = "",
+    ) -> bool:
+        """Simulate what vLLM's OffloadingConnector would do: offload a KV block via gRPC."""
+        if not self.cache_client:
+            return False
+
+        # Allocate a slot, store data
+        ids = await self.cache_client.allocate_blocks([block_hash])
+        if ids is None:
+            return False
+        block_id = ids[0]
+        return await self.cache_client.store_block(
+            block_id=block_id,
+            block_hash=block_hash,
+            data=data,
+            model_id=model_id,
+        )
+
+    async def fetch_block(self, block_hash: str, block_id: int) -> Optional[bytes]:
+        """Fetch a cached KV block back via gRPC."""
+        if not self.cache_client:
+            return None
+        return await self.cache_client.load_block(block_id)
 
     @staticmethod
     def _generate_mock_response(prompt: str) -> str:

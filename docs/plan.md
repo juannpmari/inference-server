@@ -958,19 +958,189 @@ echo "=== Phase H: ALL CHECKS PASSED ==="
 
 ---
 
-### Phase I — KV Cache L1 (5 tasks) — needs B, parallel with C/D
+### Phase I — KV Cache L1 (9 tasks) — needs B, parallel with C/D
+
+#### Memory Hierarchy Overview (this step focuses only on L1)
+
+```
+┌─────────────────────────────────────────────────────────────────────┐
+│  GPU SRAM (~20 MB, ~19 TB/s)                                       │
+│  Hardware-managed. FlashAttention tiles Q,K,V into shared memory.   │
+│  Not in our code.                                                   │
+├─────────────────────────────────────────────────────────────────────┤
+│  GPU HBM (40-80 GB, ~2-3 TB/s)                                     │
+│  vLLM PagedAttention manages KV blocks here during inference.       │
+│  gpu_memory_utilization=0.70 → 70% for weights + KV cache.         │
+│  When HBM pressure grows → blocks offloaded to L1.                 │
+├─────────────────────────────────────────────────────────────────────┤
+│  L1 Cache — CPU DRAM (512 MB–2 GB, local, per-pod)        ← THIS  │
+│  Pinned memory pool. CuPy cudaMemcpyAsync for transfers.           │
+│  LRU eviction. Managed by sidecar. ~12 GB/s on PCIe 4.0.          │
+├─────────────────────────────────────────────────────────────────────┤
+│  L2 Cache — Distributed Redis (shared across pods)                 │
+│  ConsistentHashRing routing. Network-bound (~1-10 Gbps).           │
+│  Enables cross-pod KV reuse. Planned for Phase L.                  │
+└─────────────────────────────────────────────────────────────────────┘
+```
+
+---
+
+#### Design Decisions (answers to "Things to plan in detail")
+
+**1. Interaction with sidecar: how does the sidecar offload or load from L1?**
+
+The sidecar exposes a gRPC service (`KVCacheAPIService` in `kv_cache_api.py`) with two RPCs:
+- `OffloadKVBlock(key, block_ref)` → sidecar's `MultiTieredCacheManager.process_offload()` → allocates in L1 pinned memory → `cudaMemcpyAsync` Device→Host
+- `FetchKVBlock(key, dest_ref)` → `MultiTieredCacheManager.execute_fetch()` → looks up L1 → `cudaMemcpyAsync` Host→Device → returns to HBM
+
+The engine calls these RPCs. In mock mode, the sidecar accepts the same RPCs but `GPUTransferHandler` simulates transfers with `asyncio.sleep`. In real mode, CuPy handles actual CUDA transfers.
+
+```
+Engine (vLLM)                         Sidecar (same pod)
+─────────────                         ──────────────────
+HBM pressure detected         ─gRPC─→ OffloadKVBlock(key, block_ref)
+                                       │
+                                       ├─ L1Allocator.allocate(size)
+                                       ├─ GPUTransferHandler.copy_hbm_to_dram()
+                                       ├─ KVBlockRegistry.register(key, location=L1, metadata)
+                                       └─ LRUPolicy.track_new(key)
+
+Cache needed for request       ─gRPC─→ FetchKVBlock(key, dest_ref)
+                                       │
+                                       ├─ KVBlockRegistry.lookup(key)
+                                       ├─ GPUTransferHandler.copy_dram_to_hbm()
+                                       ├─ LRUPolicy.record_access(key)
+                                       └─ return Status(success=True)
+```
+
+**2. How does the engine decide when to offload or load from L1?**
+
+vLLM v1 (0.11.0+) has a native `OffloadingConnector` with a pluggable backend API. We implement
+a **custom offloading backend** that delegates to the sidecar's gRPC service instead of vLLM's
+built-in CPU swap. This gives us control over eviction policy, registry, and L2 promotion.
+
+The flow is:
+1. vLLM's scheduler detects HBM pressure (block usage > threshold)
+2. Scheduler's `OffloadingManager` selects victim blocks (LRU among inactive sequences)
+3. `OffloadingManager` emits `StoreRequest` events via `KVConnectorMetadata`
+4. Our custom `SidecarOffloadingConnector` (worker-side) translates these into gRPC `OffloadKVBlock` calls
+5. On cache hit (prefix reuse), scheduler emits `LoadRequest` → our connector calls `FetchKVBlock`
+
+For mock mode (no GPU), we bypass vLLM's connector and simulate the same flow:
+- `MockEngine` exposes `offload_block(key, size)` and `fetch_block(key)` methods
+- These call the sidecar gRPC directly, using mock block references
+- This allows full integration testing of the L1 pipeline without a GPU
+
+**3. Is there a "registry" of stored KV blocks? Is it also used by L2?**
+
+Yes. We introduce a `KVBlockRegistry` — a unified metadata store tracking **where** each KV block
+lives (L1, L2, or evicted). This is the single source of truth for block location.
+
+```python
+@dataclass
+class KVBlockEntry:
+    key: str                          # block hash (from vLLM's block_hashes)
+    location: Literal["L1", "L2"]     # current tier
+    size_bytes: int                   # block size
+    l1_address: Optional[int]         # CPU address if in L1
+    l2_node_id: Optional[str]         # Redis node if in L2
+    model_id: str                     # which model produced this block
+    prefix_hash: str                  # prefix hash for routing affinity
+    created_at: float                 # timestamp
+    last_accessed: float              # for LRU
+    access_count: int                 # for frequency-based decisions
+```
+
+The registry is:
+- **Queried by L1** during put/get to check existing entries
+- **Queried by L2** during promotion/demotion to update location
+- **Queried by cache-aware routing** (Phase J) to score backends by prefix affinity
+- **Exposed via REST** `GET /cache/blocks` for observability and routing decisions
+
+**4. Design for cache-aware routing compatibility (Phase J)**
+
+The `KVBlockRegistry` stores `prefix_hash` and `model_id` per block. Phase J's router will:
+1. Compute `prefix_hash` for incoming request
+2. Query each pod's sidecar `GET /cache/blocks?prefix_hash=<hash>&model_id=<model>`
+3. Score backends: `score = cache_hit_weight * has_prefix + (1 - load_weight) * (1 - normalized_load)`
+4. Route to highest-scoring backend
+
+To support this, Phase I exposes:
+- `GET /cache/blocks` — list all registered blocks (with optional prefix_hash filter)
+- `GET /cache/stats` — summary: total blocks, L1 usage, hit rate
+
+**5. Telemetry for observability on loading and retrieval latency**
+
+New Prometheus metrics in `l1_cache/metrics.py`:
+
+| Metric | Type | Labels | Description |
+|--------|------|--------|-------------|
+| `l1_cache_capacity_bytes` | Gauge | — | Total L1 pool size |
+| `l1_cache_used_bytes` | Gauge | — | Currently allocated bytes |
+| `l1_cache_utilization_ratio` | Gauge | — | used / capacity |
+| `l1_cache_operations_total` | Counter | op={put,get}, status={hit,miss,error} | Operation count |
+| `l1_cache_operation_duration_seconds` | Histogram | op={put,get} | End-to-end latency (includes transfer) |
+| `l1_cache_transfer_duration_seconds` | Histogram | direction={to_cpu,to_gpu} | Raw CUDA memcpy time |
+| `l1_cache_transfer_bytes_total` | Counter | direction={to_cpu,to_gpu} | Transfer throughput tracking |
+| `l1_cache_evictions_total` | Counter | reason={capacity,explicit} | Eviction count |
+| `l1_cache_blocks_stored` | Gauge | — | Current block count in L1 |
+
+**6. Actual CUDA memcpy implementation**
+
+Use **CuPy** (`cupy` package) for GPU↔CPU transfers with pinned memory:
+
+```python
+import cupy as cp
+
+# Allocate pinned (page-locked) host memory — required for async transfers
+pinned_pool = cp.cuda.PinnedMemoryPool()
+cp.cuda.set_pinned_memory_allocator(pinned_pool.malloc)
+host_buffer = cupyx.empty_pinned((size_bytes,), dtype=cp.uint8)
+
+# GPU → CPU (offload)
+with cp.cuda.Stream() as stream:
+    gpu_array = cp.ndarray(shape, dtype, cp.cuda.MemoryPointer(gpu_mem, offset))
+    host_buffer.copy_from_device_async(gpu_array, stream)
+    stream.synchronize()
+
+# CPU → GPU (restore)
+with cp.cuda.Stream() as stream:
+    gpu_dest = cp.ndarray(shape, dtype, cp.cuda.MemoryPointer(gpu_mem, offset))
+    gpu_dest.copy_from_host_async(host_buffer, stream)
+    stream.synchronize()
+```
+
+When `enable_engine_mock=True`, the `GPUTransferHandler` skips CuPy and uses `asyncio.sleep(0.001)`
+to simulate transfer latency. A factory function selects the right implementation:
+
+```python
+def create_transfer_handler(mock: bool = False) -> GPUTransferHandler:
+    if mock:
+        return MockGPUTransferHandler()
+    return CuPyGPUTransferHandler()
+```
+
+---
+
+#### Task Breakdown
 
 | Task | Description | Files | Test | ~Min |
 |------|------------|-------|------|------|
-| **7.1** | Fix L1 cache import: `eviction_policies` → `eviction_policy` + absolute imports | `l1_cache/api.py` | Module imports without error | 15 |
-| **7.2** | Implement `check_global_availability()` and `execute_l1_eviction()` in cache_manager | `sidecar/cache_manager.py` | Unit: availability True after put, eviction frees space | 40 |
-| **7.3** | Add L1 cache metrics (capacity, used, hits, misses, evictions) | `l1_cache/metrics.py`, `l1_cache/api.py` | 3 puts + 2 gets → correct metric values | 30 |
-| **7.4** | L1 cache unit tests (allocator, LRU, put/get, eviction, miss) | `tests/unit/test_l1_cache.py` | 7 test cases | 45 |
-| **7.5** | Cache manager unit tests (multi-tier offload, fetch, availability, eviction) | `tests/unit/test_cache_manager.py` | 7 test cases with mocked L1 + L2 | 45 |
+| **I.1** | **KV Block Registry**: Create `KVBlockRegistry` class that tracks block metadata (key, location, size, prefix_hash, model_id, timestamps, access_count). Methods: `register(entry)`, `unregister(key)`, `lookup(key) -> Optional[KVBlockEntry]`, `query_by_prefix(prefix_hash, model_id) -> List[KVBlockEntry]`, `update_location(key, new_location)`, `stats() -> dict`. Store in-memory dict with JSON persistence to `{registry_path}/kv_blocks.json`. Import shared types from `shared/types.py` and add `KVBlockEntry` dataclass there. | `shared/types.py`, `sidecar/kv_block_registry.py` | Unit: register → lookup returns entry; unregister → lookup returns None; query_by_prefix filters correctly; stats reflect counts; persistence round-trip works | 50 |
+| **I.2** | **GPU Transfer Handler — real CuPy implementation**: Refactor `GPUTransferHandler` into a protocol/ABC. Implement `CuPyGPUTransferHandler` that uses `cupy.cuda.Stream`, pinned memory via `cupyx.empty_pinned`, and `copy_from_device_async` / `copy_from_host_async` for actual GPU↔CPU transfers. Keep existing mock as `MockGPUTransferHandler` (asyncio.sleep). Add factory `create_transfer_handler(mock: bool)`. Update `l1_cache/api.py` to accept handler via constructor injection instead of creating internally. Add `cupy` as optional dependency (`pip install cupy-cuda12x` or env-dependent). | `l1_cache/gpu_transfer.py`, `l1_cache/api.py`, `pyproject.toml` | Unit (mock): factory returns correct type; Mock handler returns TransferStatus(True); CuPy handler import check (skip if no GPU). Integration (GPU only): 1MB transfer round-trip, data integrity check | 60 |
+| **I.3** | **L1 Allocator — pinned memory pool**: Refactor `L1Allocator` to manage a real pinned-memory pool when CuPy is available. Use `cupy.cuda.PinnedMemoryPool` for the backing store. Track allocations with a free-list (not just a counter) so `free()` actually reclaims specific regions. Add `MockL1Allocator` that keeps current counter-based behavior. Constructor: `L1Allocator(capacity_bytes, mock=False)`. Expose `available_bytes`, `used_bytes`, `allocation_count` properties. | `l1_cache/allocator.py` | Unit (mock): allocate → AllocationPointer with valid address; allocate beyond capacity → None; free reclaims exact bytes; fragmentation: alloc A, alloc B, free A, alloc C fits in A's space | 50 |
+| **I.4** | **Cache Manager — implement stubs + registry integration**: Implement `check_global_availability(key)` — query `KVBlockRegistry.lookup(key)` to check if block exists in any tier. Implement `execute_l1_eviction(needed_bytes)` — use `LRUPolicy.select_victim()` in a loop until enough space freed, calling `L1CacheAPI._evict_victim()` for each, unregistering from `KVBlockRegistry`. Update `process_offload()` to register blocks in `KVBlockRegistry` after successful L1 put. Update `execute_fetch()` to update `last_accessed` in registry on hit. Fix `kv_cache_api.py` OffloadKVBlock bug (missing key extraction from request). Remove all `NotImplementedError` stubs. | `sidecar/cache_manager.py`, `sidecar/kv_cache_api.py` | Unit: `check_global_availability` True after put, False after eviction; `execute_l1_eviction` frees requested bytes and removes from registry; process_offload creates registry entry; OffloadKVBlock extracts key correctly | 60 |
+| **I.5** | **L1 Cache REST endpoints for routing compatibility**: Add endpoints to sidecar's FastAPI app for cache-aware routing (Phase J) to query. `GET /cache/blocks` — returns list of `KVBlockEntry` (optional query params: `prefix_hash`, `model_id`). `GET /cache/stats` — returns `{total_blocks, l1_blocks, l1_used_bytes, l1_capacity_bytes, hit_rate, eviction_count}`. These endpoints read from `KVBlockRegistry`. Wire `KVBlockRegistry` into sidecar app lifespan (created once, passed to cache manager and endpoints). | `sidecar/api.py`, `sidecar/kv_block_registry.py` | Unit: `GET /cache/blocks` returns empty list initially; after mock offload, returns 1 entry; `GET /cache/stats` returns correct structure; prefix_hash filter works | 40 |
+| **I.6** | **L1 Cache Prometheus metrics**: Create `l1_cache/metrics.py` with all metrics from the telemetry table above. Instrument `L1CacheAPI.put()` and `get()` with operation counters, duration histograms, and transfer byte counters. Instrument `GPUTransferHandler` with `l1_cache_transfer_duration_seconds`. Instrument eviction in `_evict_victim()` with `l1_cache_evictions_total`. Update capacity/used gauges on every allocate/free. Expose via existing sidecar `/metrics` endpoint (already serves Prometheus). | `l1_cache/metrics.py`, `l1_cache/api.py`, `l1_cache/gpu_transfer.py`, `l1_cache/allocator.py` | Unit: 3 puts + 2 gets → `l1_cache_operations_total{op=put}` = 3, `{op=get,status=hit}` = 2; after eviction → `l1_cache_evictions_total` incremented; `l1_cache_used_bytes` matches allocator state | 45 |
+| **I.7** | **Engine ↔ Sidecar offload wiring**: Add `SidecarCacheClient` to engine that wraps gRPC calls to sidecar's `KVCacheAPIService`. Methods: `async offload_block(key, block_ref)`, `async fetch_block(key, dest_ref)`, `async check_availability(key)`. In `MockEngine`, add `offload_block()` and `fetch_block()` that call the sidecar client, simulating what vLLM's `OffloadingConnector` would do. Add engine config field `sidecar_grpc_url` (default `localhost:50051`). In real engine mode, document where the custom `SidecarOffloadingConnector` would plug in (as a comment/TODO for when vLLM's OffloadingConnector API is used in production). | `engine/sidecar_cache_client.py` (new), `engine/mock_engine.py`, `engine/config.py` | Unit: MockEngine.offload_block() calls client; client serializes BlockReference correctly; fetch_block round-trip with mocked sidecar returns success | 50 |
+| **I.8** | **L1 cache unit tests**: Comprehensive test suite covering all L1 components. Tests: (1) Allocator alloc/free cycle, (2) Allocator capacity exhaustion returns None, (3) Allocator free-list reclamation, (4) LRU ordering after mixed accesses, (5) LRU victim selection after removal, (6) L1CacheAPI put/get round-trip (mock transfer), (7) L1CacheAPI eviction on capacity pressure, (8) L1CacheAPI get miss returns False, (9) KVBlockRegistry CRUD + query_by_prefix, (10) KVBlockRegistry persistence round-trip. | `tests/unit/test_l1_cache.py` | 10 test cases, all pass | 50 |
+| **I.9** | **Cache manager + integration tests**: Test the full multi-tier cache pipeline. Tests: (1) process_offload stores in L1 and registers in KVBlockRegistry, (2) execute_fetch hits L1 and updates access time, (3) execute_fetch misses L1 → falls through to L2 mock, (4) check_global_availability returns True for L1 block, (5) execute_l1_eviction frees space and unregisters, (6) L1 full → offload triggers eviction → still succeeds, (7) REST /cache/blocks returns registered blocks, (8) REST /cache/stats reflects current state, (9) Metrics counters match operations performed. | `tests/unit/test_cache_manager.py` | 9 test cases with mocked L1 transfers + mocked L2, all pass | 55 |
+
+---
 
 #### Phase I — Verification Checkpoint
 
-Run the following. **All 5 checks must pass**:
+Run the following. **All 7 checks must pass**:
 
 ```bash
 #!/bin/bash
@@ -978,18 +1148,22 @@ set -e
 echo "=== Phase I Verification ==="
 
 # 1. All L1 cache modules import without error
-echo "[1/5] Checking L1 cache imports..."
+echo "[1/7] Checking L1 cache imports..."
 python -c "
 from data_plane.inference.sidecar.l1_cache.api import L1CacheAPI
 from data_plane.inference.sidecar.l1_cache.allocator import L1Allocator
 from data_plane.inference.sidecar.l1_cache.eviction_policy import LRUPolicy, EvictionPolicy
-from data_plane.inference.sidecar.l1_cache.gpu_transfer import GPUTransferHandler
+from data_plane.inference.sidecar.l1_cache.gpu_transfer import (
+    GPUTransferHandler, MockGPUTransferHandler, create_transfer_handler
+)
 from data_plane.inference.sidecar.cache_manager import MultiTieredCacheManager
+from data_plane.inference.sidecar.kv_block_registry import KVBlockRegistry
+from shared.types import KVBlockEntry, BlockReference, TransferResult, AllocationPointer
 print('  All L1 cache modules import OK')
 " && echo "  PASS: imports" || { echo "FAIL: L1 cache import error"; exit 1; }
 
 # 2. No NotImplementedError remains in cache_manager
-echo "[2/5] Checking for NotImplementedError..."
+echo "[2/7] Checking for NotImplementedError..."
 NOT_IMPL=$(grep -n 'NotImplementedError' data-plane/inference/sidecar/cache_manager.py || true)
 if [ -z "$NOT_IMPL" ]; then
   echo "  PASS: no NotImplementedError stubs"
@@ -999,41 +1173,107 @@ else
   exit 1
 fi
 
-# 3. L1 allocator works: alloc + free cycle
-echo "[3/5] Testing L1 allocator cycle..."
+# 3. L1 allocator works: alloc + free cycle with free-list reclamation
+echo "[3/7] Testing L1 allocator cycle..."
 python -c "
 from data_plane.inference.sidecar.l1_cache.allocator import L1Allocator
 
-alloc = L1Allocator(capacity_bytes=1024, block_size=64)
-ptr = alloc.allocate(128)
-assert ptr is not None, 'Allocation failed'
-print(f'  Allocated: offset={ptr.offset}, size={ptr.size}')
+alloc = L1Allocator(capacity_bytes=1024, mock=True)
+ptr_a = alloc.allocate(256)
+assert ptr_a is not None, 'First allocation failed'
+print(f'  Allocated A: address={ptr_a.cpu_address}, size={ptr_a.size_bytes}')
 
-freed = alloc.free(ptr)
-assert freed, 'Free failed'
-print(f'  Freed: {freed}')
-print(f'  Available after free: {alloc.available_bytes} bytes')
+ptr_b = alloc.allocate(256)
+assert ptr_b is not None, 'Second allocation failed'
+print(f'  Allocated B: address={ptr_b.cpu_address}, size={ptr_b.size_bytes}')
+
+# Free A, then allocate C — should fit in A's reclaimed space
+alloc.free(ptr_a)
+print(f'  Freed A. Available: {alloc.available_bytes} bytes')
+
+ptr_c = alloc.allocate(256)
+assert ptr_c is not None, 'Reclaimed allocation failed'
+print(f'  Allocated C (in reclaimed space): address={ptr_c.cpu_address}, size={ptr_c.size_bytes}')
+print(f'  Final available: {alloc.available_bytes} bytes')
 " && echo "  PASS: allocator" || { echo "FAIL: allocator"; exit 1; }
 
 # 4. LRU eviction ordering is correct
-echo "[4/5] Testing LRU eviction order..."
+echo "[4/7] Testing LRU eviction order..."
 python -c "
 from data_plane.inference.sidecar.l1_cache.eviction_policy import LRUPolicy
 
 lru = LRUPolicy()
-lru.record_access('a')
-lru.record_access('b')
-lru.record_access('c')
+lru.track_new('a', 100)
+lru.track_new('b', 200)
+lru.track_new('c', 300)
 lru.record_access('a')  # 'a' most recent, 'b' oldest
 
 victim = lru.select_victim()
 assert victim == 'b', f'Expected b (oldest), got {victim}'
-print(f'  LRU victim after a,b,c,a: {victim} (correct: b is oldest)')
+print(f'  LRU victim after track(a,b,c), access(a): {victim} (correct: b is oldest)')
 " && echo "  PASS: LRU ordering" || { echo "FAIL: LRU"; exit 1; }
 
-# 5. All cache tests pass (L1 + cache manager)
-echo "[5/5] Running cache unit tests..."
-uv run pytest tests/unit/ -k "cache" -v --tb=short 2>&1 | tail -15
+# 5. KV Block Registry CRUD works
+echo "[5/7] Testing KV Block Registry..."
+python -c "
+import tempfile, os
+from data_plane.inference.sidecar.kv_block_registry import KVBlockRegistry
+from shared.types import KVBlockEntry
+
+with tempfile.TemporaryDirectory() as tmpdir:
+    reg = KVBlockRegistry(persist_path=os.path.join(tmpdir, 'kv_blocks.json'))
+
+    entry = KVBlockEntry(
+        key='block-001', location='L1', size_bytes=4096,
+        l1_address=0x10000000, l2_node_id=None,
+        model_id='test-model', prefix_hash='abc123',
+        created_at=1000.0, last_accessed=1000.0, access_count=0
+    )
+    reg.register(entry)
+    assert reg.lookup('block-001') is not None, 'Lookup failed after register'
+    print(f'  Registered and looked up block-001')
+
+    results = reg.query_by_prefix('abc123', 'test-model')
+    assert len(results) == 1, f'Expected 1 result, got {len(results)}'
+    print(f'  query_by_prefix returned {len(results)} result(s)')
+
+    stats = reg.stats()
+    assert stats['total_blocks'] == 1, f'Expected 1 block, got {stats[\"total_blocks\"]}'
+    print(f'  Stats: {stats}')
+
+    reg.unregister('block-001')
+    assert reg.lookup('block-001') is None, 'Lookup should be None after unregister'
+    print(f'  Unregistered block-001 successfully')
+" && echo "  PASS: KV Block Registry" || { echo "FAIL: KV Block Registry"; exit 1; }
+
+# 6. Cache REST endpoints respond
+echo "[6/7] Testing cache REST endpoints..."
+python -c "
+import asyncio
+from httpx import AsyncClient, ASGITransport
+from data_plane.inference.sidecar.api import app
+
+async def test():
+    transport = ASGITransport(app=app)
+    async with AsyncClient(transport=transport, base_url='http://test') as client:
+        r = await client.get('/cache/blocks')
+        assert r.status_code == 200, f'Expected 200, got {r.status_code}'
+        assert isinstance(r.json(), list), 'Expected list'
+        print(f'  GET /cache/blocks -> {r.status_code}, {len(r.json())} blocks')
+
+        r = await client.get('/cache/stats')
+        assert r.status_code == 200, f'Expected 200, got {r.status_code}'
+        body = r.json()
+        assert 'total_blocks' in body, f'Missing total_blocks in {body}'
+        assert 'hit_rate' in body, f'Missing hit_rate in {body}'
+        print(f'  GET /cache/stats -> {r.status_code}, keys={list(body.keys())}')
+
+asyncio.run(test())
+" && echo "  PASS: cache REST endpoints" || { echo "FAIL: cache REST"; exit 1; }
+
+# 7. All cache tests pass (L1 + cache manager)
+echo "[7/7] Running cache unit tests..."
+uv run pytest tests/unit/test_l1_cache.py tests/unit/test_cache_manager.py -v --tb=short 2>&1 | tail -20
 echo "  PASS: cache unit tests"
 
 echo ""
@@ -1043,6 +1283,8 @@ echo "=== Phase I: ALL CHECKS PASSED ==="
 ---
 
 ### Phase J — Cache-Aware Routing (5 tasks) — needs C + I
+
+UPDATE: This could be moved to scaling_plan, so it is implemented as part of the scaling strategies
 
 | Task | Description | Files | Test | ~Min |
 |------|------------|-------|------|------|
@@ -1353,7 +1595,7 @@ echo "========================================"
 Sprint 0 (first):    Docs                   →  2 files → docs/plan.md + docs/requirements-and-decisions.md
 Sprint 1 (Day 1):    Phase A + B            →  8 tasks → architecture foundation + testability
 Sprint 2 (Days 2-3): Phase C + D (parallel) → 15 tasks → core engine (with mock flag) + sidecar work
-Sprint 3 (Days 3-4): Phase E + I            →  7 tasks → Docker infra + cache
+Sprint 3 (Days 3-4): Phase E + I            → 11 tasks → Docker infra + cache (L1)
 Sprint 4 (Days 4-5): Phase F + G + H        → 12 tasks → streaming, LoRA, registry
 Sprint 5 (Days 5-6): Phase J + K + L + M    → 17 tasks → routing, robustness, completion
 ```
