@@ -1,0 +1,69 @@
+syntax = "proto3";
+
+package kv_cache;
+
+service KVCacheService {
+  // Engine sends block bytes to sidecar for storage
+  rpc StoreBlock(StoreBlockRequest) returns (StoreBlockResponse);
+
+  // Engine requests block bytes back from sidecar
+  rpc LoadBlock(LoadBlockRequest) returns (LoadBlockResponse);
+
+  // Query available capacity in the sidecar
+  rpc GetFreeBlocks(GetFreeBlocksRequest) returns (GetFreeBlocksResponse);
+
+  // Reserve block slots by hash
+  rpc AllocateBlocks(AllocateBlocksRequest) returns (AllocateBlocksResponse);
+
+  // Release a block slot
+  rpc FreeBlock(FreeBlockRequest) returns (FreeBlockResponse);
+}
+
+message StoreBlockRequest {
+  int32 block_id = 1;
+  string block_hash = 2;
+  bytes data = 3;
+  string model_id = 4;
+  string layer_name = 5;
+}
+
+message StoreBlockResponse {
+  bool success = 1;
+  string message = 2;
+}
+
+message LoadBlockRequest {
+  int32 block_id = 1;
+  string layer_name = 2;
+}
+
+message LoadBlockResponse {
+  bool success = 1;
+  bytes data = 2;
+  string message = 3;
+}
+
+message GetFreeBlocksRequest {}
+
+message GetFreeBlocksResponse {
+  int32 num_free_blocks = 1;
+}
+
+message AllocateBlocksRequest {
+  repeated string block_hashes = 1;
+}
+
+message AllocateBlocksResponse {
+  bool success = 1;
+  repeated int32 block_ids = 2;
+  string message = 3;
+}
+
+message FreeBlockRequest {
+  int32 block_id = 1;
+}
+
+message FreeBlockResponse {
+  bool success = 1;
+  string message = 2;
+}

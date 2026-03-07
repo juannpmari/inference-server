@@ -4,28 +4,46 @@ import time
 from contextlib import asynccontextmanager
 from typing import Optional
 
-from fastapi import FastAPI, HTTPException, status
+from fastapi import FastAPI, HTTPException, Query, status
 from fastapi.responses import JSONResponse, Response
 from prometheus_client import REGISTRY, generate_latest
 
 from data_plane.inference.sidecar import metrics
 from data_plane.inference.sidecar.artifact_manager import ArtifactManager
 from data_plane.inference.sidecar.config import SidecarConfig
+from data_plane.inference.sidecar.kv_block_registry import KVBlockRegistry
 
 logger = logging.getLogger(__name__)
 
 # Global state
 _manager: Optional[ArtifactManager] = None
 _config: Optional[SidecarConfig] = None
+_kv_registry: Optional[KVBlockRegistry] = None
+_grpc_server = None
 
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
-    global _manager, _config
+    global _manager, _config, _kv_registry, _grpc_server
     logger.info("Starting sidecar...")
 
     _config = SidecarConfig()
     _manager = ArtifactManager(config=_config)
+    _kv_registry = KVBlockRegistry()
+
+    # Start gRPC KV cache server
+    from data_plane.inference.sidecar.cache_manager import MultiTieredCacheManager
+    from data_plane.inference.sidecar.grpc_server import create_grpc_server
+    from data_plane.inference.sidecar.l1_cache.api import L1ByteStore
+    from data_plane.inference.sidecar.l2_cache.connector import L2Connector
+
+    l1_store = L1ByteStore(
+        num_blocks=_config.l1_num_blocks,
+        block_size_bytes=_config.l1_block_size_bytes,
+    )
+    l2 = L2Connector()
+    cache_manager = MultiTieredCacheManager(l1=l1_store, l2=l2, registry=_kv_registry)
+    _grpc_server = await create_grpc_server(cache_manager, port=_config.grpc_port)
 
     # Load initial model in background
     _manager.model_registry[_config.initial_model] = {
@@ -51,6 +69,9 @@ async def lifespan(app: FastAPI):
 
     yield
 
+    if _grpc_server is not None:
+        await _grpc_server.stop(grace=5)
+        logger.info("gRPC server stopped")
     logger.info("Sidecar shutdown complete")
 
 
@@ -154,6 +175,23 @@ async def get_models():
     return _manager.model_registry
 
 
+@app.post("/adapter/unload/{adapter_identifier:path}", tags=["adapters"])
+async def unload_adapter_route(adapter_identifier: str):
+    """Remove an adapter from the registry."""
+    if _manager is None:
+        raise HTTPException(status_code=status.HTTP_503_SERVICE_UNAVAILABLE, detail="Sidecar not initialized")
+
+    if adapter_identifier not in _manager.adapter_registry:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail=f"Adapter {adapter_identifier} not resident.",
+        )
+
+    _manager.unload_adapter(adapter_identifier)
+    metrics.sidecar_resident_adapters.set(len(_manager.adapter_registry))
+    return {"status": "success", "adapter_identifier": adapter_identifier}
+
+
 @app.get("/registry/adapters", tags=["registry"])
 async def get_adapters():
     """Returns the current resident adapters."""
@@ -162,30 +200,88 @@ async def get_adapters():
     return _manager.adapter_registry
 
 
-@app.post("/adapter/fetch/{adapter_identifier:path}", tags=["adapters"])
-async def fetch_adapter_route(adapter_identifier: str, version: str = "latest"):
-    """Ensure a LoRA adapter's files are present on the shared disk."""
+@app.post("/adapter/load/{adapter_identifier:path}", tags=["adapters"])
+async def load_adapter_route(adapter_identifier: str, version: str = "latest"):
+    """Trigger a LoRA adapter download (fire-and-forget, returns 202).
+
+    Poll GET /registry/adapters to check when status becomes "loaded".
+    """
     if _manager is None:
         raise HTTPException(status_code=status.HTTP_503_SERVICE_UNAVAILABLE, detail="Sidecar not initialized")
 
-    try:
-        start = time.time()
-        local_path = await _manager.fetch_adapter(adapter_identifier, version)
-        duration = time.time() - start
+    # Already loaded — return immediately
+    existing = _manager.adapter_registry.get(adapter_identifier)
+    if existing and existing.get("version") == version and existing.get("status") == "loaded":
+        return {"status": "loaded", "adapter_identifier": adapter_identifier, "local_path": existing["local_path"]}
 
-        metrics.sidecar_adapter_load_duration_seconds.labels(adapter=adapter_identifier).observe(duration)
-        metrics.sidecar_resident_adapters.set(len(_manager.adapter_registry))
-
-        return {"status": "success", "adapter_identifier": adapter_identifier, "local_path": local_path}
-    except Exception as e:
-        logger.error(f"Failed to fetch adapter {adapter_identifier}: {e}")
-        raise HTTPException(
-            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
-            detail=f"Failed to fetch adapter: {str(e)}",
+    # Already downloading — don't start a second task
+    if existing and existing.get("status") == "downloading":
+        return JSONResponse(
+            status_code=status.HTTP_202_ACCEPTED,
+            content={"status": "downloading", "adapter_identifier": adapter_identifier},
         )
+
+    # Mark as downloading and kick off background task
+    _manager.adapter_registry[adapter_identifier] = {
+        "adapter_id": adapter_identifier,
+        "version": version,
+        "status": "downloading",
+    }
+
+    async def _background_fetch():
+        try:
+            start = time.time()
+            local_path = await _manager.fetch_adapter(adapter_identifier, version)
+            duration = time.time() - start
+            metrics.sidecar_adapter_load_duration_seconds.labels(adapter=adapter_identifier).observe(duration)
+            metrics.sidecar_resident_adapters.set(len(_manager.adapter_registry))
+            logger.info(f"Background adapter fetch complete: {adapter_identifier} at {local_path}")
+        except Exception as e:
+            logger.error(f"Background adapter fetch failed for {adapter_identifier}: {e}")
+
+    asyncio.create_task(_background_fetch())
+
+    return JSONResponse(
+        status_code=status.HTTP_202_ACCEPTED,
+        content={"status": "downloading", "adapter_identifier": adapter_identifier},
+    )
 
 
 @app.get("/metrics", tags=["monitoring"])
 async def metrics_endpoint():
     """Prometheus metrics endpoint."""
     return Response(content=generate_latest(REGISTRY), media_type="text/plain; charset=utf-8")
+
+
+# --- Cache endpoints (for cache-aware routing in Phase J) ---
+
+
+@app.get("/cache/blocks", tags=["cache"])
+async def get_cache_blocks(
+    prefix_hash: Optional[str] = Query(None),
+    model_id: Optional[str] = Query(None),
+):
+    """List cached KV blocks, optionally filtered by prefix_hash and model_id."""
+    if _kv_registry is None:
+        return []
+    if prefix_hash:
+        entries = _kv_registry.query_by_prefix(prefix_hash, model_id or "")
+    else:
+        entries = _kv_registry.all_entries()
+    return [e.to_dict() for e in entries]
+
+
+@app.get("/cache/stats", tags=["cache"])
+async def get_cache_stats():
+    """Summary statistics for cache state (used by routing and observability)."""
+    if _kv_registry is None:
+        return {
+            "total_blocks": 0,
+            "l1_blocks": 0,
+            "l2_blocks": 0,
+            "l1_used_bytes": 0,
+            "l2_used_bytes": 0,
+            "hit_rate": 0.0,
+            "eviction_count": 0,
+        }
+    return _kv_registry.stats()

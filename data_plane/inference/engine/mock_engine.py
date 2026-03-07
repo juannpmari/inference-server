@@ -5,7 +5,9 @@ Provides a deterministic mock implementation with the same interface as the real
 
 import asyncio
 import logging
-from typing import Dict, List, Optional
+from typing import Dict, Optional
+
+from data_plane.inference.engine.sidecar_cache_client import SidecarCacheClient
 
 logger = logging.getLogger(__name__)
 
@@ -48,6 +50,29 @@ class MockLLMEngine:
         self.request_futures: Dict[str, asyncio.Future] = {}
         self.pending_requests = {}
         self.finished_requests = []
+
+        # LoRA adapter tracking
+        self.loaded_loras: Dict[int, object] = {}
+        self.lora_load_count: int = 0
+        self.lora_remove_count: int = 0
+
+        # Cache client for KV block offload/fetch (created from config or set later)
+        self.cache_client: Optional[SidecarCacheClient] = None
+        if config and getattr(config, "sidecar_grpc_url", None):
+            self.cache_client = SidecarCacheClient(
+                grpc_url=config.sidecar_grpc_url,
+            )
+
+        # Initialize LoRA manager if enabled
+        self.lora_manager = None
+        if config and getattr(config, "enable_lora", False):
+            from data_plane.inference.engine.lora_manager import LoRAManager
+            self.lora_manager = LoRAManager(
+                engine=self,
+                config=config,
+                sidecar_url=getattr(config, "sidecar_url", "http://localhost:8001"),
+            )
+
         logger.info("MockLLMEngine initialized")
 
     def is_ready(self) -> bool:
@@ -69,6 +94,17 @@ class MockLLMEngine:
 
         future = asyncio.Future()
         self.request_futures[request_id] = future
+
+        # Handle LoRA adapter (same pattern as real Engine)
+        if adapter_identifier and self.lora_manager:
+            try:
+                await self.lora_manager.ensure_adapter_loaded(
+                    adapter_identifier=adapter_identifier,
+                    adapter_version=adapter_version,
+                )
+            except Exception as e:
+                future.set_exception(RuntimeError(f"Failed to load adapter: {e}"))
+                return await future
 
         # Generate deterministic response based on prompt
         response_text = self._generate_mock_response(prompt)
@@ -151,10 +187,50 @@ class MockLLMEngine:
         """Synchronous generation method for simple usage."""
         return self._generate_mock_response(prompt)
 
-    async def add_lora(self, lora_request):
-        """Mock LoRA loading (no-op)"""
-        name = getattr(lora_request, 'lora_name', str(lora_request))
-        logger.info(f"Mock: LoRA adapter {name} loaded")
+    def add_lora(self, lora_request):
+        """Mock LoRA loading — tracks adapter in internal state."""
+        int_id = lora_request.lora_int_id
+        name = lora_request.lora_name
+        self.loaded_loras[int_id] = lora_request
+        self.lora_load_count += 1
+        logger.info(f"Mock: LoRA adapter {name} (id={int_id}) loaded. "
+                     f"Total loaded: {len(self.loaded_loras)}")
+
+    def remove_lora(self, lora_int_id: int):
+        """Mock LoRA removal — removes adapter from internal state."""
+        removed = self.loaded_loras.pop(lora_int_id, None)
+        self.lora_remove_count += 1
+        name = getattr(removed, "lora_name", str(lora_int_id)) if removed else str(lora_int_id)
+        logger.info(f"Mock: LoRA adapter {name} (id={lora_int_id}) removed. "
+                     f"Total loaded: {len(self.loaded_loras)}")
+
+    async def offload_block(
+        self,
+        block_hash: str,
+        data: bytes,
+        model_id: str = "",
+    ) -> bool:
+        """Simulate what vLLM's OffloadingConnector would do: offload a KV block via gRPC."""
+        if not self.cache_client:
+            return False
+
+        # Allocate a slot, store data
+        ids = await self.cache_client.allocate_blocks([block_hash])
+        if ids is None:
+            return False
+        block_id = ids[0]
+        return await self.cache_client.store_block(
+            block_id=block_id,
+            block_hash=block_hash,
+            data=data,
+            model_id=model_id,
+        )
+
+    async def fetch_block(self, block_hash: str, block_id: int) -> Optional[bytes]:
+        """Fetch a cached KV block back via gRPC."""
+        if not self.cache_client:
+            return None
+        return await self.cache_client.load_block(block_id)
 
     @staticmethod
     def _generate_mock_response(prompt: str) -> str:

@@ -3,7 +3,7 @@ import logging
 import os
 import shutil
 import tempfile
-from typing import Dict, Optional
+from typing import Dict, List, Optional
 
 from huggingface_hub import snapshot_download
 
@@ -102,7 +102,14 @@ class ArtifactManager:
             shutil.rmtree(tmp_dir, ignore_errors=True)
             raise
 
-    async def load_model(self, model_identifier: str, version: str = "latest") -> str:
+    async def load_model(
+        self,
+        model_identifier: str,
+        version: str = "latest",
+        tags: Optional[List[str]] = None,
+        warmup_prompts: Optional[List[str]] = None,
+        preferred_device: Optional[str] = None,
+    ) -> str:
         """Downloads the model if necessary and registers it as resident."""
 
         existing = self.model_registry.get(model_identifier)
@@ -111,12 +118,19 @@ class ArtifactManager:
             return existing["local_path"]
 
         local_path = await self._fetch_from_external_storage("model", model_identifier, version)
-        self.model_registry[model_identifier] = {
+        entry: Dict = {
             "model_id": model_identifier,
             "version": version,
             "local_path": local_path,
             "status": "loaded",
         }
+        if tags is not None:
+            entry["tags"] = tags
+        if warmup_prompts is not None:
+            entry["warmup_prompts"] = warmup_prompts
+        if preferred_device is not None:
+            entry["preferred_device"] = preferred_device
+        self.model_registry[model_identifier] = entry
         self._persist_registry()
         return local_path
 
@@ -127,14 +141,58 @@ class ArtifactManager:
             self._persist_registry()
             logger.info(f"Model {model_identifier} unloaded from registry.")
 
+    def unload_adapter(self, adapter_identifier: str):
+        """Removes the adapter from the registry."""
+        if adapter_identifier in self.adapter_registry:
+            del self.adapter_registry[adapter_identifier]
+            self._persist_registry()
+            logger.info(f"Adapter {adapter_identifier} unloaded from registry.")
+
     async def fetch_adapter(self, adapter_identifier: str, version: str = "latest") -> str:
+        """Downloads the adapter if necessary and registers it as resident.
+
+        Updates adapter_registry status: "downloading" -> "loaded" (or removes on failure).
+        Caller should set status to "downloading" before calling if using fire-and-forget pattern.
+        """
+        existing = self.adapter_registry.get(adapter_identifier)
+        if existing and existing.get("version") == version and existing.get("status") == "loaded":
+            logger.info(f"Adapter {adapter_identifier} v{version} already resident.")
+            return existing["local_path"]
+
+        try:
+            local_path = await self._fetch_from_external_storage("adapter", adapter_identifier, version)
+            self.adapter_registry[adapter_identifier] = {
+                "adapter_id": adapter_identifier,
+                "version": version,
+                "local_path": local_path,
+                "status": "loaded",
+            }
+            self._persist_registry()
+            return local_path
+        except Exception:
+            # Remove failed entry so it can be retried
+            self.adapter_registry.pop(adapter_identifier, None)
+            self._persist_registry()
+            raise
+    async def fetch_adapter(
+        self,
+        adapter_identifier: str,
+        version: str = "latest",
+        tags: Optional[List[str]] = None,
+        preferred_device: Optional[str] = None,
+    ) -> str:
         """Downloads the adapter if necessary and registers it as resident."""
         local_path = await self._fetch_from_external_storage("adapter", adapter_identifier, version)
-        self.adapter_registry[adapter_identifier] = {
+        entry: Dict = {
             "adapter_id": adapter_identifier,
             "version": version,
             "local_path": local_path,
             "status": "loaded",
         }
+        if tags is not None:
+            entry["tags"] = tags
+        if preferred_device is not None:
+            entry["preferred_device"] = preferred_device
+        self.adapter_registry[adapter_identifier] = entry
         self._persist_registry()
         return local_path

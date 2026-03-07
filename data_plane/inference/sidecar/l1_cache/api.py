@@ -1,82 +1,126 @@
-from typing import Dict
+"""L1 byte store — in-memory block storage for the sidecar.
 
-from data_plane.inference.sidecar.l1_cache.allocator import AllocationPointer, L1Allocator
+The sidecar cannot access GPU memory (separate container). It stores raw bytes
+keyed by block_id, with LRU eviction and Prometheus metrics.
+"""
+
+import logging
+import time
+from typing import Optional
+
+from data_plane.inference.sidecar.l1_cache import metrics as l1_metrics
+from data_plane.inference.sidecar.l1_cache.allocator import BlockSlotAllocator
 from data_plane.inference.sidecar.l1_cache.eviction_policy import LRUPolicy
-from data_plane.inference.sidecar.l1_cache.gpu_transfer import GPUTransferHandler
+
+logger = logging.getLogger(__name__)
 
 
-class L1CacheAPI:
-    """
-    The L1 Facade.
-    It coordinates the Allocator, Transfer Handler, and Eviction Policy
-    to provide simple 'put' and 'get' operations for the Cache Manager.
-    """
+class L1ByteStore:
+    """In-memory byte store with block-slot allocation and LRU eviction."""
 
-    def __init__(self, capacity_gb: float = 1.0):
-        # 1. Initialize Components
-        capacity_bytes = int(capacity_gb * 1024**3)
-        self.allocator = L1Allocator(capacity_bytes)
-        self.transfer = GPUTransferHandler()
+    def __init__(self, num_blocks: int = 1024, block_size_bytes: int = 131072):
+        self.allocator = BlockSlotAllocator(num_blocks)
         self.eviction_policy = LRUPolicy()
+        self._block_size = block_size_bytes
+        # block_id -> bytes
+        self._data: dict[int, bytes] = {}
+        # block_id -> block_hash (for registry/eviction tracking)
+        self._id_to_hash: dict[int, str] = {}
+        # block_hash -> block_id (reverse lookup)
+        self._hash_to_id: dict[str, int] = {}
 
-        # Internal map: Key -> AllocationPointer
-        # Used to find the physical address when given a logical key
-        self._key_map: Dict[str, AllocationPointer] = {}
+        l1_metrics.l1_cache_capacity_bytes.set(num_blocks * block_size_bytes)
+        l1_metrics.l1_cache_used_bytes.set(0)
+        l1_metrics.l1_cache_blocks_stored.set(0)
 
-    async def put(self, key: str, hbm_addr: int, size: int) -> bool:
-        """
-        Offloads data from HBM to L1. Handles allocation and automatic eviction.
-        """
-        # 1. Try Allocate
-        pointer = self.allocator.allocate(size)
+    def _update_metrics(self) -> None:
+        used = len(self._data) * self._block_size
+        cap = self.allocator.num_blocks * self._block_size
+        l1_metrics.l1_cache_used_bytes.set(used)
+        l1_metrics.l1_cache_utilization_ratio.set(used / cap if cap > 0 else 0)
+        l1_metrics.l1_cache_blocks_stored.set(len(self._data))
 
-        # 2. If full, run Eviction Loop
-        while pointer is None:
-            victim_key = self.eviction_policy.select_victim()
-            if not victim_key:
-                print("Error: L1 Full and no victims to evict!")
-                return False
+    def get_num_free_blocks(self) -> int:
+        return self.allocator.num_free
 
-            # Evict the victim
-            print(f"Evicting L1 victim: {victim_key}")
-            self._evict_victim(victim_key)
+    def allocate_blocks(self, block_hashes: list[str]) -> Optional[list[int]]:
+        """Reserve block slots for the given hashes. Returns block IDs or None."""
+        # Evict if needed to make room
+        needed = len(block_hashes) - self.allocator.num_free
+        while needed > 0:
+            victim_hash = self.eviction_policy.select_victim()
+            if not victim_hash:
+                break
+            victim_id = self._hash_to_id.get(victim_hash)
+            if victim_id is not None:
+                self._evict(victim_id)
+                l1_metrics.l1_cache_evictions_total.labels(reason="capacity").inc()
+            needed -= 1
 
-            # Retry allocation
-            pointer = self.allocator.allocate(size)
+        ids = self.allocator.allocate_n(len(block_hashes))
+        if ids is None:
+            return None
 
-        # 3. Perform Transfer
-        status = await self.transfer.copy_hbm_to_dram(hbm_addr, pointer.cpu_address, size)
+        for block_id, block_hash in zip(ids, block_hashes):
+            self._id_to_hash[block_id] = block_hash
+            self._hash_to_id[block_hash] = block_id
 
-        if status.success:
-            # 4. Update State
-            self._key_map[key] = pointer
-            self.eviction_policy.track_new(key, size)
-            return True
-        else:
-            # Rollback allocation if transfer failed
-            self.allocator.free(pointer)
+        return ids
+
+    def store(self, block_id: int, data: bytes, block_hash: str) -> bool:
+        """Store block bytes at a previously allocated slot."""
+        start = time.monotonic()
+        if not self.allocator.is_allocated(block_id):
+            l1_metrics.l1_cache_operations_total.labels(op="store", status="error").inc()
             return False
 
-    async def get(self, key: str, dest_hbm_addr: int) -> bool:
-        """
-        Retrieves data from L1 to HBM.
-        """
-        pointer = self._key_map.get(key)
-        if not pointer:
-            return False  # Cache Miss
+        self._data[block_id] = data
+        self._id_to_hash[block_id] = block_hash
+        self._hash_to_id[block_hash] = block_id
+        self.eviction_policy.track_new(block_hash, len(data))
+        l1_metrics.l1_cache_operations_total.labels(op="store", status="hit").inc()
+        l1_metrics.l1_cache_transfer_bytes_total.labels(direction="store").inc(len(data))
+        self._update_metrics()
+        l1_metrics.l1_cache_operation_duration_seconds.labels(op="store").observe(
+            time.monotonic() - start
+        )
+        return True
 
-        # 1. Transfer
-        status = await self.transfer.copy_dram_to_hbm(pointer.cpu_address, dest_hbm_addr, pointer.size_bytes)
+    def load(self, block_id: int) -> Optional[bytes]:
+        """Retrieve block bytes. Returns None on miss."""
+        start = time.monotonic()
+        data = self._data.get(block_id)
+        if data is None:
+            l1_metrics.l1_cache_operations_total.labels(op="load", status="miss").inc()
+            return None
 
-        # 2. Update Policy (LRU touch)
-        if status.success:
-            self.eviction_policy.record_access(key)
-            return True
-        return False
+        block_hash = self._id_to_hash.get(block_id)
+        if block_hash:
+            self.eviction_policy.record_access(block_hash)
+        l1_metrics.l1_cache_operations_total.labels(op="load", status="hit").inc()
+        l1_metrics.l1_cache_transfer_bytes_total.labels(direction="load").inc(len(data))
+        l1_metrics.l1_cache_operation_duration_seconds.labels(op="load").observe(
+            time.monotonic() - start
+        )
+        return data
 
-    def _evict_victim(self, key: str):
-        """Internal helper to remove a specific key from L1."""
-        pointer = self._key_map.pop(key, None)
-        if pointer:
-            self.allocator.free(pointer)
-            self.eviction_policy.remove(key)
+    def free(self, block_id: int) -> bool:
+        """Release a block slot and its data."""
+        block_hash = self._id_to_hash.pop(block_id, None)
+        if block_hash:
+            self._hash_to_id.pop(block_hash, None)
+            self.eviction_policy.remove(block_hash)
+        self._data.pop(block_id, None)
+        result = self.allocator.free(block_id)
+        self._update_metrics()
+        return result
+
+    def _evict(self, block_id: int) -> None:
+        """Evict a specific block by ID."""
+        block_hash = self._id_to_hash.pop(block_id, None)
+        if block_hash:
+            self._hash_to_id.pop(block_hash, None)
+            self.eviction_policy.remove(block_hash)
+        self._data.pop(block_id, None)
+        self.allocator.free(block_id)
+        self._update_metrics()
