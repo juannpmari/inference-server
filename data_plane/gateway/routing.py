@@ -20,6 +20,8 @@ class GenerateRequest(BaseModel):
     model: str = Field("llama-3-8b", description="Model name from the routing table")
     prompt: str = Field("Hello, world!", description="Text prompt for generation")
     max_tokens: Optional[int] = Field(32, description="Maximum tokens to generate")
+    adapter_identifier: Optional[str] = Field(default=None, description="LoRA adapter identifier (e.g. HuggingFace repo)")
+    adapter_version: Optional[str] = Field(default=None, description="LoRA adapter version/revision")
 
 
 _config = GatewayConfig()
