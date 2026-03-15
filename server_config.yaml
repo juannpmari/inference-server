@@ -1,0 +1,87 @@
+# ============================================================
+# Centralized Server Configuration
+# ============================================================
+# This file is the single source of truth for all non-secret
+# configuration. Mount it into each container via docker-compose.
+# Secrets (HF_TOKEN, etc.) remain in .env.
+# ============================================================
+
+# --- Gateway ---
+gateway:
+  host: "0.0.0.0"
+  port: 8000
+  request_timeout: 300.0   # seconds
+
+# --- Engine ---
+engine:
+  host: "0.0.0.0"
+  port: 8080
+  model_name: "Qwen/Qwen2-0.5B"
+  max_model_len: 512
+  gpu_memory_utilization: 0.70
+  dtype: "bfloat16"
+  max_pending: 10
+  temperature: 0.0
+  enable_lora: false
+  max_loras: 4
+  max_lora_rank: 16
+  adapter_poll_interval: 1.0    # seconds
+  adapter_poll_timeout: 600.0   # seconds
+  sidecar_url: "http://sidecar:8001"
+  sidecar_poll_interval: 2.0    # seconds
+  sidecar_timeout: 600.0        # seconds
+  sidecar_grpc_url: "sidecar:50051"
+  model_path: "/models/resident_model"
+  enable_kv_offload: false
+  kv_offload_num_blocks: 1024
+  enable_engine_mock: false
+
+# --- Sidecar ---
+sidecar:
+  host: "0.0.0.0"
+  port: 8001
+  grpc_port: 50051
+  shared_volume: "/mnt/models"
+  model_store_path: "/mnt/models"
+  registry_path: "/mnt/models/registry.json"
+  max_adapters: 10
+  engine_url: "http://engine:8080"
+  initial_model: "Qwen/Qwen2-0.5B"
+  initial_model_version: "main"
+  # L1 cache
+  l1_capacity_mb: 512
+  l1_num_blocks: 1024
+  l1_block_size_bytes: 131072   # 128 KB
+
+# --- L2 / Redis ---
+l2:
+  redis_host: "redis"
+  redis_port: 6379
+  redis_maxmem: "256mb"
+
+# --- gRPC ---
+grpc:
+  max_message_size: 16777216    # 16 MB
+  rpc_timeout: 5.0              # seconds
+
+# --- Distributed cache (controller / storage nodes) ---
+distributed_cache:
+  controller_port: 50051
+  watcher_service_addr: "kv-cache-watcher:50051"
+  # Storage node defaults (overridden per-pod in K8s)
+  storage_node_id: "redis-0"
+  storage_redis_host: "localhost"
+  storage_redis_port: 6379
+  hash_ring_replicas: 3
+  health_check_interval: 5      # seconds
+
+# --- Prometheus ---
+prometheus:
+  scrape_interval: "15s"
+  evaluation_interval: "15s"
+
+# --- Model routing table (gateway) ---
+routing:
+  model_service_map:
+    "llama-3-8b": "http://engine:8080"
+    # "mistral-7b": "http://vllm-mistral-7b-svc:8000"

@@ -9,12 +9,14 @@ from typing import Optional
 
 import grpc
 
+from shared.config_loader import get_config
 from shared.proto import kv_cache_pb2, kv_cache_pb2_grpc
 
 logger = logging.getLogger(__name__)
 
-# 16 MB max message size
-_MAX_MESSAGE_SIZE = 16 * 1024 * 1024
+_grpc_cfg = get_config("grpc")
+_MAX_MESSAGE_SIZE = _grpc_cfg.get("max_message_size", 16 * 1024 * 1024)
+_RPC_TIMEOUT = _grpc_cfg.get("rpc_timeout", 5.0)
 
 _GRPC_OPTIONS = [
     ("grpc.max_send_message_length", _MAX_MESSAGE_SIZE),
@@ -49,7 +51,7 @@ class SidecarCacheClient:
                     model_id=model_id,
                     layer_name=layer_name,
                 ),
-                timeout=5.0,
+                timeout=_RPC_TIMEOUT,
             )
             return resp.success
         except grpc.RpcError as e:
@@ -64,7 +66,7 @@ class SidecarCacheClient:
                     block_id=block_id,
                     layer_name=layer_name,
                 ),
-                timeout=5.0,
+                timeout=_RPC_TIMEOUT,
             )
             if resp.success:
                 return resp.data
@@ -78,7 +80,7 @@ class SidecarCacheClient:
         try:
             resp = await self._stub.GetFreeBlocks(
                 kv_cache_pb2.GetFreeBlocksRequest(),
-                timeout=5.0,
+                timeout=_RPC_TIMEOUT,
             )
             return resp.num_free_blocks
         except grpc.RpcError as e:
@@ -90,7 +92,7 @@ class SidecarCacheClient:
         try:
             resp = await self._stub.AllocateBlocks(
                 kv_cache_pb2.AllocateBlocksRequest(block_hashes=block_hashes),
-                timeout=5.0,
+                timeout=_RPC_TIMEOUT,
             )
             if resp.success:
                 return list(resp.block_ids)
@@ -104,7 +106,7 @@ class SidecarCacheClient:
         try:
             resp = await self._stub.FreeBlock(
                 kv_cache_pb2.FreeBlockRequest(block_id=block_id),
-                timeout=5.0,
+                timeout=_RPC_TIMEOUT,
             )
             return resp.success
         except grpc.RpcError as e:

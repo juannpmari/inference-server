@@ -7,11 +7,8 @@ services:
       - "8000:8000"
     env_file:
       - .env
-    environment:
-      - GATEWAY_HOST=0.0.0.0
-      - GATEWAY_PORT=8000
-    # depends_on:
-    #   - engine
+    volumes:
+      - ./server_config.yaml:/app/server_config.yaml:ro
     restart: unless-stopped
 
   engine:
@@ -22,15 +19,9 @@ services:
       - "8080:8080"
     env_file:
       - .env
-    environment:
-      - ENGINE_HOST=0.0.0.0
-      - ENGINE_PORT=8080
-      - ENGINE_SIDECAR_URL=http://sidecar:8001
-      - ENGINE_MODEL_NAME=arnir0/Tiny-LLM
-      # - ENABLE_ENGINE_MOCK=true
-      - ENGINE_ENABLE_LORA=true
     volumes:
       - ./model-store:/mnt/models
+      - ./server_config.yaml:/app/server_config.yaml:ro
     depends_on:
       - sidecar
     deploy:
@@ -52,15 +43,10 @@ services:
     env_file:
       - .env
     environment:
-      - SIDECAR_HOST=0.0.0.0
-      - SIDECAR_PORT=8001
-      # - SIDECAR_ENGINE_URL=http://engine:8080
-      - SIDECAR_INITIAL_MODEL=arnir0/Tiny-LLM
-      - SIDECAR_INITIAL_MODEL_VERSION=main
-      - L2_REDIS_HOST=redis
-      - L2_REDIS_PORT=6379
+      - HF_HUB_DISABLE_XET=1
     volumes:
       - ./model-store:/mnt/models
+      - ./server_config.yaml:/app/server_config.yaml:ro
     depends_on:
       - redis
     restart: unless-stopped

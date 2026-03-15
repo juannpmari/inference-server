@@ -5,10 +5,13 @@ import grpc
 import redis.asyncio as redis
 from typing import List, Optional, Dict, Tuple, NamedTuple
 
+from shared.config_loader import get_config
+
 # --- Configuration ---
-# In a real K8s setup, these would be env vars
-WATCHER_SERVICE_ADDR = "kv-cache-watcher:50051"
-REDIS_PORT = 6379
+_dc_cfg = get_config("distributed_cache")
+_l2_cfg = get_config("l2")
+WATCHER_SERVICE_ADDR = _dc_cfg.get("watcher_service_addr", "kv-cache-watcher:50051")
+REDIS_PORT = _l2_cfg.get("redis_port", 6379)
 
 # Mock Protobuf imports (You would generate these from .proto files)
 # from kv_watcher_pb2 import ClusterMapRequest
@@ -31,7 +34,7 @@ class ConsistentHashRing:
     Determines which Storage Node holds a specific Key.
     This replicates the 'L2 Placement Policy' logic locally in the sidecar.
     """
-    def __init__(self, replicas: int = 3):
+    def __init__(self, replicas: int = _dc_cfg.get("hash_ring_replicas", 3)):
         self.replicas = replicas
         self.ring: Dict[int, StorageNode] = {}
         self.sorted_keys: List[int] = []

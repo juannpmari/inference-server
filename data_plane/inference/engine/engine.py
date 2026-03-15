@@ -5,7 +5,7 @@ import logging
 
 try:
     from vllm import EngineArgs, LLMEngine, SamplingParams
-    from vllm.utils import FlexibleArgumentParser
+    from vllm.engine.arg_utils import FlexibleArgumentParser
     VLLM_AVAILABLE = True
 except ImportError:
     VLLM_AVAILABLE = False
@@ -27,9 +27,6 @@ class Engine:
         self.config = config
         self.request_counter = 0
         self.request_futures: Dict[str, asyncio.Future] = {}
-
-        from vllm.utils import FlexibleArgumentParser
-        from vllm import EngineArgs
 
         parser = FlexibleArgumentParser()
         parser = EngineArgs.add_cli_args(parser)
@@ -64,7 +61,6 @@ class Engine:
             ])
 
         args = parser.parse_args(cli_args_list)
-        from vllm import EngineArgs, SamplingParams
         engine_args = EngineArgs.from_cli_args(args)
         self.sampling_params = SamplingParams(temperature=config.temperature)
 

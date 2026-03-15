@@ -191,7 +191,7 @@ async def inference(request: InferenceRequest):
                 temperature=request.temperature,
                 max_tokens=request.max_tokens
             ),
-            timeout=300.0  # 5 minute timeout
+            timeout=_config.sidecar_timeout
         )
 
         duration = time.time() - start_time

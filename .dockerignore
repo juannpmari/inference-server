@@ -12,3 +12,7 @@ tests/
 plan.md
 summary.md
 test.ipynb
+hf_cache/
+model-store/
+cuda-keyring*
+.python-version

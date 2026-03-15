@@ -1,6 +1,8 @@
 from pydantic import Field
 from pydantic_settings import BaseSettings
 
+from shared.config_loader import yaml_settings_source
+
 
 class EngineConfig(BaseSettings):
     model_config = {
@@ -33,3 +35,11 @@ class EngineConfig(BaseSettings):
         alias="ENABLE_ENGINE_MOCK",
         description="Set to true to use mock engine (no GPU needed)",
     )
+
+    @classmethod
+    def settings_customise_sources(cls, settings_cls, **kwargs):
+        return (
+            kwargs["init_settings"],    # explicit kwargs (highest)
+            kwargs["env_settings"],     # environment variables
+            yaml_settings_source("engine"),  # YAML config file
+        )

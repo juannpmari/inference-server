@@ -2,21 +2,34 @@
 # TODO: implement true load-aware routing (ie., based on queue length)
 
 
-
-
 from contextlib import asynccontextmanager
+from typing import Optional
+
 from fastapi import FastAPI
 from fastapi.exceptions import HTTPException
 import httpx
 from fastapi.responses import JSONResponse
 from http import HTTPStatus
+from pydantic import BaseModel, Field
+
+from data_plane.gateway.config import GatewayConfig
+from shared.config_loader import get_config
+
+
+class GenerateRequest(BaseModel):
+    model: str = Field("llama-3-8b", description="Model name from the routing table")
+    prompt: str = Field("Hello, world!", description="Text prompt for generation")
+    max_tokens: Optional[int] = Field(32, description="Maximum tokens to generate")
+
+
+_config = GatewayConfig()
+_routing_cfg = get_config("routing")
 
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     # Startup: store the httpx AsyncClient instance in the application state
-    # Set a reasonable timeout for the *entire* request/response cycle
-    app.state.http_client = httpx.AsyncClient(timeout=300.0)  # 5 minutes
+    app.state.http_client = httpx.AsyncClient(timeout=_config.request_timeout)
     yield
     # Shutdown: cancel the httpx client when the server shuts down
     await app.state.http_client.aclose()
@@ -31,18 +44,17 @@ async def health():
 
 # 2. Model-to-Service Mapping (The "Routing Table")
 # In Kubernetes, this is the Service DNS name pointing to the GPU Worker Pod
-MODEL_SERVICE_MAP = {
+MODEL_SERVICE_MAP: dict[str, str] = _routing_cfg.get("model_service_map", {
     "llama-3-8b": "http://engine:8080",
-    # "mistral-7b": "http://vllm-mistral-7b-svc:8000",
-}
+})
 
 
 @app.post("/generate")
-async def generate(event: dict):
+async def generate(event: GenerateRequest):
     """
     Routes the generation request to the corresponding GPU Worker Service.
     """
-    model_name = event['model']
+    model_name = event.model
 
     worker_url = MODEL_SERVICE_MAP.get(model_name)
     if worker_url is None:
@@ -52,18 +64,18 @@ async def generate(event: dict):
 
     try:
         http_client: httpx.AsyncClient = app.state.http_client
-        
+
         # We forward the entire event dictionary as the JSON body
         response = await http_client.post(
-            target_url, 
-            json=event
+            target_url,
+            json=event.model_dump(exclude_none=True)
         )
 
         if response.status_code >= 400:
             return JSONResponse(
                 status_code=response.status_code,
                 # Pass the worker's error body (decoded to string)
-                content={"detail": "Worker failed to generate response.", 
+                content={"detail": "Worker failed to generate response.",
                          "worker_message": response.text}
             )
 

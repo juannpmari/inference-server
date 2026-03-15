@@ -4,8 +4,11 @@ import grpc
 from typing import List, Dict, NamedTuple
 import random
 
+from shared.config_loader import get_config
+
 # --- Configuration ---
-CONTROLLER_PORT = 50051
+_dc_cfg = get_config("distributed_cache")
+CONTROLLER_PORT = _dc_cfg.get("controller_port", 50051)
 
 # --- Type Definitions ---
 class StorageNode(NamedTuple):
@@ -73,7 +76,7 @@ class KVCacheWatcher(kv_cache_pb2_grpc.KVCacheWatcherServicer):
     async def _run_health_check_loop(self):
         """Simulates an internal loop checking node health (e.g., external pings)."""
         while True:
-            await asyncio.sleep(5) # Check every 5 seconds
+            await asyncio.sleep(_dc_cfg.get("health_check_interval", 5))
             
             # Simulate a node failure occasionally
             if random.random() < 0.05:

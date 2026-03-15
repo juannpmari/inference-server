@@ -1,24 +1,61 @@
-FROM python:3.12-slim AS base
+# ── Stage 1: Builder ─────────────────────────────────────────────
+FROM nvidia/cuda:12.4.1-devel-ubuntu22.04 AS builder
 
+ENV DEBIAN_FRONTEND=noninteractive
 WORKDIR /app
 
-# Install system deps for grpcio and vllm compilation
-RUN apt-get update && apt-get install -y --no-install-recommends \
-    build-essential \
-    && rm -rf /var/lib/apt/lists/*
+# Install Python 3.12 via deadsnakes PPA and build deps (single apt-get update)
+RUN apt-get update && \
+    apt-get install -y --no-install-recommends \
+        software-properties-common gpg-agent && \
+    add-apt-repository ppa:deadsnakes/ppa && \
+    apt-get install -y --no-install-recommends \
+        python3.12 python3.12-venv python3.12-dev \
+        build-essential curl && \
+    rm -rf /var/lib/apt/lists/* && \
+    update-alternatives --install /usr/bin/python3 python3 /usr/bin/python3.12 1 && \
+    update-alternatives --install /usr/bin/python python /usr/bin/python3.12 1
 
 # Install uv for fast dependency management
-RUN pip install --no-cache-dir uv
+RUN curl -LsSf https://astral.sh/uv/install.sh | sh
+ENV PATH="/root/.local/bin:$PATH"
 
-# Copy project metadata and dependency files
-COPY pyproject.toml README.md uv.lock* ./
+# Copy ONLY dependency metadata first (layer cache for deps)
+COPY pyproject.toml uv.lock README.md ./
 
-# Copy application code
+# Install production dependencies (cached unless pyproject.toml/uv.lock change)
+ENV UV_HTTP_TIMEOUT=300
+RUN uv sync --frozen --no-dev --extra engine
+
+# ── Stage 2: Runtime ────────────────────────────────────────────
+FROM nvidia/cuda:12.4.1-runtime-ubuntu22.04 AS runtime
+
+ENV DEBIAN_FRONTEND=noninteractive
+WORKDIR /app
+
+# Install only the Python runtime (no dev/build packages)
+RUN apt-get update && \
+    apt-get install -y --no-install-recommends \
+        software-properties-common gpg-agent && \
+    add-apt-repository ppa:deadsnakes/ppa && \
+    apt-get install -y --no-install-recommends \
+        python3.12 python3.12-venv curl && \
+    rm -rf /var/lib/apt/lists/* && \
+    update-alternatives --install /usr/bin/python3 python3 /usr/bin/python3.12 1 && \
+    update-alternatives --install /usr/bin/python python /usr/bin/python3.12 1
+
+# Install uv (needed for `uv run`)
+RUN curl -LsSf https://astral.sh/uv/install.sh | sh
+ENV PATH="/root/.local/bin:$PATH"
+
+# Copy installed venv and project metadata from builder
+COPY --from=builder /app/.venv /app/.venv
+COPY --from=builder /app/pyproject.toml /app/uv.lock /app/README.md ./
+
+# Copy application code (changes here do NOT invalidate dependency cache)
+COPY server_config.yaml ./
 COPY shared/ ./shared/
 COPY data_plane/ ./data_plane/
-
-# Install production dependencies
-RUN uv sync --no-dev
 
 # Create model storage directory (shared volume with sidecar)
 RUN mkdir -p /mnt/models
