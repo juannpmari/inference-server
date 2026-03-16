@@ -85,11 +85,15 @@ class Engine:
         max_tokens: Optional[int] = None
     ):
         if sampling_params is None:
+            from vllm import SamplingParams
+            kwargs = {}
             if temperature is not None:
-                from vllm import SamplingParams
-                sampling_params = SamplingParams(temperature=temperature)
+                kwargs["temperature"] = temperature
             else:
-                sampling_params = self.sampling_params
+                kwargs["temperature"] = self.config.temperature
+            if max_tokens is not None:
+                kwargs["max_tokens"] = max_tokens
+            sampling_params = SamplingParams(**kwargs)
 
         request_id = str(self.request_counter)
         self.request_counter += 1

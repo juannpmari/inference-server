@@ -199,12 +199,21 @@ class LoRAManager:
                 if entry and entry.get("status") == "loaded":
                     return entry["local_path"]
 
-                if entry:
-                    logger.debug(
-                        f"Adapter {identifier} status='{entry.get('status')}', polling..."
+                if entry and entry.get("status") == "failed":
+                    error = entry.get("error", "unknown error")
+                    raise RuntimeError(
+                        f"Sidecar failed to fetch adapter {identifier}: {error}"
                     )
-                else:
-                    logger.debug(f"Adapter {identifier} not in registry yet, polling...")
+
+                if not entry:
+                    # Entry disappeared — sidecar removed it on failure
+                    raise RuntimeError(
+                        f"Adapter {identifier} disappeared from sidecar registry (download likely failed)"
+                    )
+
+                logger.debug(
+                    f"Adapter {identifier} status='{entry.get('status')}', polling..."
+                )
             except httpx.RequestError as e:
                 logger.warning(f"Sidecar poll failed ({e}), retrying...")
 

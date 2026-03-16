@@ -238,6 +238,12 @@ async def load_adapter_route(adapter_identifier: str, version: str = "latest"):
             logger.info(f"Background adapter fetch complete: {adapter_identifier} at {local_path}")
         except Exception as e:
             logger.error(f"Background adapter fetch failed for {adapter_identifier}: {e}")
+            _manager.adapter_registry[adapter_identifier] = {
+                "adapter_id": adapter_identifier,
+                "version": version,
+                "status": "failed",
+                "error": str(e),
+            }
 
     asyncio.create_task(_background_fetch())
 
