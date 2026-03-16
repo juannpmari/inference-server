@@ -16,15 +16,15 @@ gateway:
 engine:
   host: "0.0.0.0"
   port: 8080
-  model_name: "Qwen/Qwen2-0.5B"
+  model_name: "Qwen/Qwen2-0.5B-Instruct"
   max_model_len: 512
   gpu_memory_utilization: 0.70
   dtype: "bfloat16"
   max_pending: 10
   temperature: 0.0
-  enable_lora: false
+  enable_lora: true
   max_loras: 4
-  max_lora_rank: 16
+  max_lora_rank: 64
   adapter_poll_interval: 1.0    # seconds
   adapter_poll_timeout: 600.0   # seconds
   sidecar_url: "http://sidecar:8001"
@@ -46,7 +46,7 @@ sidecar:
   registry_path: "/mnt/models/registry.json"
   max_adapters: 10
   engine_url: "http://engine:8080"
-  initial_model: "Qwen/Qwen2-0.5B"
+  initial_model: "Qwen/Qwen2-0.5B-Instruct"
   initial_model_version: "main"
   # L1 cache
   l1_capacity_mb: 512
@@ -84,4 +84,5 @@ prometheus:
 routing:
   model_service_map:
     "llama-3-8b": "http://engine:8080"
+    "Qwen/Qwen2-0.5B-Instruct": "http://engine:8080"
     # "mistral-7b": "http://vllm-mistral-7b-svc:8000"

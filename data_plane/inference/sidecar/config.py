@@ -25,7 +25,7 @@ class SidecarConfig(BaseSettings):
     l2_redis_host: str = "localhost"
     l2_redis_port: int = 6379
     grpc_port: int = 50051
-    initial_model: str = "arnir0/Tiny-LLM"
+    initial_model: str = "Qwen/Qwen2-0.5B"
     initial_model_version: str = "main"
     model_store_path: str = "/mnt/models"
     registry_path: str = "/mnt/models/registry.json"

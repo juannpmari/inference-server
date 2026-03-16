@@ -22,8 +22,11 @@ services:
     volumes:
       - ./model-store:/mnt/models
       - ./server_config.yaml:/app/server_config.yaml:ro
+      - /usr/lib/wsl:/usr/lib/wsl:ro
     depends_on:
       - sidecar
+    environment:
+      - LD_LIBRARY_PATH=/usr/lib/wsl/lib:/usr/local/cuda/lib64
     deploy:
       resources:
         reservations:
@@ -47,30 +50,30 @@ services:
     volumes:
       - ./model-store:/mnt/models
       - ./server_config.yaml:/app/server_config.yaml:ro
-    depends_on:
-      - redis
+    # depends_on:
+    #   - redis
     restart: unless-stopped
 
-  redis:
-    image: redis:7-alpine
-    ports:
-      - "6379:6379"
-    command: redis-server --maxmemory 256mb --maxmemory-policy allkeys-lru
-    volumes:
-      - redis-data:/data
-    restart: unless-stopped
+  # redis:
+  #   image: redis:7-alpine
+  #   ports:
+  #     - "6379:6379"
+  #   command: redis-server --maxmemory 256mb --maxmemory-policy allkeys-lru
+  #   volumes:
+  #     - redis-data:/data
+  #   restart: unless-stopped
 
-  prometheus:
-    image: prom/prometheus:latest
-    ports:
-      - "9090:9090"
-    volumes:
-      - ./docker/prometheus.yml:/etc/prometheus/prometheus.yml:ro
-    depends_on:
-      - gateway
-      - engine
-      - sidecar
-    restart: unless-stopped
+  # prometheus:
+  #   image: prom/prometheus:latest
+  #   ports:
+  #     - "9090:9090"
+  #   volumes:
+  #     - ./docker/prometheus.yml:/etc/prometheus/prometheus.yml:ro
+  #   depends_on:
+  #     - gateway
+  #     - engine
+  #     - sidecar
+  #   restart: unless-stopped
 
 volumes:
   redis-data:

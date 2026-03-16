@@ -73,7 +73,7 @@ class LoRAManager:
 
     @staticmethod
     def _adapter_int_id(identifier: str, version: Optional[str]) -> int:
-        return hash(identifier + (version or "latest")) & 0xFFFFFFFF
+        return hash(identifier + (version or "latest")) & 0x7FFFFFFF
 
     async def ensure_adapter_loaded(
         self,
