@@ -13,6 +13,7 @@ from data_plane.inference.sidecar.artifact_manager import ArtifactManager
 from data_plane.inference.sidecar.config import SidecarConfig
 from data_plane.inference.sidecar.kv_block_registry import KVBlockRegistry
 
+logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s [%(name)s] %(message)s")
 logger = logging.getLogger(__name__)
 
 # Global state
