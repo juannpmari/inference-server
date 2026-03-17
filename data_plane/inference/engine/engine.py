@@ -114,6 +114,11 @@ class Engine:
                 future.set_exception(RuntimeError(error_msg))
                 return await future
 
+        if lora_request:                                                                                                                      
+            logger.info(f"Submitting request {request_id} WITH adapter: {lora_request.lora_name} (id={lora_request.lora_int_id}, path={lora_request.lora_path})")                                                                                                      
+        else:           
+            logger.info(f"Submitting request {request_id} with base model only")
+            
         self.engine.add_request(request_id, prompt, sampling_params, lora_request=lora_request)
 
         return await future
