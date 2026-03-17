@@ -5,9 +5,12 @@ Provides a deterministic mock implementation with the same interface as the real
 
 import asyncio
 import logging
+import time
 from typing import Dict, Optional
 
+from data_plane.inference.engine import metrics
 from data_plane.inference.engine.sidecar_cache_client import SidecarCacheClient
+from shared.monitoring.models import TimingInfo, RequestRecord
 
 logger = logging.getLogger(__name__)
 
@@ -44,12 +47,14 @@ class MockLLMEngine:
     Used for testing and development on machines without GPU support.
     """
 
-    def __init__(self, config=None):
+    def __init__(self, config=None, collector=None):
         self.config = config
         self.request_counter = 0
         self.request_futures: Dict[str, asyncio.Future] = {}
+        self.request_timings: Dict[str, TimingInfo] = {}
         self.pending_requests = {}
         self.finished_requests = []
+        self.collector = collector
 
         # LoRA adapter tracking
         self.loaded_loras: Dict[int, object] = {}
@@ -79,6 +84,10 @@ class MockLLMEngine:
         """Check if engine is ready"""
         return True
 
+    def tokenize(self, text: str) -> list:
+        """Approximate token count: ~4 chars per token."""
+        return list(range(len(text) // 4 or 1))
+
     async def add_request(
         self,
         prompt: str,
@@ -95,16 +104,26 @@ class MockLLMEngine:
         future = asyncio.Future()
         self.request_futures[request_id] = future
 
+        # Create timing info
+        timing = TimingInfo(
+            submitted_at=time.time(),
+            adapter_id=adapter_identifier,
+            input_tokens=len(self.tokenize(prompt)),
+        )
+
         # Handle LoRA adapter (same pattern as real Engine)
         if adapter_identifier and self.lora_manager:
             try:
-                await self.lora_manager.ensure_adapter_loaded(
+                _, swap_duration = await self.lora_manager.ensure_adapter_loaded(
                     adapter_identifier=adapter_identifier,
                     adapter_version=adapter_version,
                 )
+                timing.adapter_swap_latency_s = swap_duration
             except Exception as e:
                 future.set_exception(RuntimeError(f"Failed to load adapter: {e}"))
                 return await future
+
+        self.request_timings[request_id] = timing
 
         # Generate deterministic response based on prompt
         response_text = self._generate_mock_response(prompt)
@@ -140,8 +159,10 @@ class MockLLMEngine:
         """
         Simulate a step of the inference loop.
         In mock mode, immediately return finished requests.
+        Records timing data for the monitoring system.
         """
         outputs = []
+        now = time.time()
 
         # Process all pending requests
         for request_id, request_data in list(self.pending_requests.items()):
@@ -154,12 +175,41 @@ class MockLLMEngine:
             self.finished_requests.append(request_id)
             del self.pending_requests[request_id]
 
+            # Record timing and build RequestRecord
+            timing = self.request_timings.get(request_id)
+            if timing:
+                timing.processing_started_at = timing.submitted_at + 0.001
+                timing.first_token_at = timing.submitted_at + 0.002
+                timing.last_step_at = now
+                timing.finished_at = now
+                timing.step_count = len(self.tokenize(request_data["response"]))
+                timing.output_tokens = timing.step_count
+
+                record = RequestRecord.from_timing(request_id, self.config.model_name if self.config else "mock", timing)
+                if self.collector:
+                    self.collector.record_request(record)
+
+                # Observe Prometheus metrics
+                model = self.config.model_name if self.config else "mock"
+                if record.ttft_s > 0:
+                    metrics.engine_time_to_first_token_seconds.labels(model=model).observe(record.ttft_s)
+                if record.tokens_per_second > 0:
+                    metrics.engine_tokens_per_second.labels(model=model).set(record.tokens_per_second)
+
+                del self.request_timings[request_id]
+
             # Fulfill the future
             if request_id in self.request_futures:
                 future = self.request_futures[request_id]
                 if not future.done():
                     future.set_result(request_data["response"])
                     del self.request_futures[request_id]
+
+        # Record batch size
+        if self.collector and outputs:
+            self.collector.record_batch_size(len(outputs))
+            model = self.config.model_name if self.config else "mock"
+            metrics.engine_batch_size.labels(model=model).observe(len(outputs))
 
         return outputs
 
