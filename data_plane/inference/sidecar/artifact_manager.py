@@ -1,8 +1,6 @@
 import asyncio
 import logging
 import os
-import shutil
-import tempfile
 from typing import Dict, List, Optional
 
 from huggingface_hub import snapshot_download
@@ -68,39 +66,30 @@ class ArtifactManager:
         """
         Download model/adapter files from HuggingFace Hub.
 
-        Uses atomic download: downloads to a temp directory, then renames into place.
+        Downloads directly to the target path. snapshot_download handles
+        resumable/partial downloads, so no temp dir + move is needed.
+        Avoids shutil.move which can corrupt directories on WSL2 bind mounts.
         """
         local_target_path = os.path.join(self.config.shared_volume, identifier.replace("/", "--"), version)
 
-        if os.path.exists(local_target_path) and os.listdir(local_target_path):
+        # Check for existing complete download (config.json is the key indicator)
+        config_marker = os.path.join(local_target_path, "config.json")
+        if os.path.exists(config_marker):
             logger.info(f"{artifact_type} {identifier} v{version} already cached at {local_target_path}")
             return local_target_path
 
         logger.info(f"Downloading {artifact_type} {identifier} v{version} from HuggingFace Hub...")
 
-        # Atomic download: use temp dir, then rename
-        tmp_dir = tempfile.mkdtemp(dir=self.config.shared_volume, prefix=f".dl-{artifact_type}-")
-        try:
-            await asyncio.to_thread(
-                snapshot_download,
-                repo_id=identifier,
-                revision=version if version != "latest" else None,
-                local_dir=tmp_dir,
-            )
+        os.makedirs(local_target_path, exist_ok=True)
+        await asyncio.to_thread(
+            snapshot_download,
+            repo_id=identifier,
+            revision=version if version != "latest" else None,
+            local_dir=local_target_path,
+        )
 
-            # Atomic rename into final location
-            os.makedirs(os.path.dirname(local_target_path), exist_ok=True)
-            if os.path.exists(local_target_path):
-                shutil.rmtree(local_target_path)
-            shutil.move(tmp_dir, local_target_path)
-
-            logger.info(f"Download complete. {artifact_type} files ready at: {local_target_path}")
-            return local_target_path
-
-        except Exception:
-            # Clean up temp dir on failure
-            shutil.rmtree(tmp_dir, ignore_errors=True)
-            raise
+        logger.info(f"Download complete. {artifact_type} files ready at: {local_target_path}")
+        return local_target_path
 
     async def load_model(
         self,

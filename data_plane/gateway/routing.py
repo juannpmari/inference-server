@@ -47,7 +47,7 @@ async def health():
 # 2. Model-to-Service Mapping (The "Routing Table")
 # In Kubernetes, this is the Service DNS name pointing to the GPU Worker Pod
 MODEL_SERVICE_MAP: dict[str, str] = _routing_cfg.get("model_service_map", {
-    "llama-3-8b": "http://engine:8080",
+    "Qwen/Qwen2-0.5B-Instruct": "http://engine:8080",
 })
 
 
