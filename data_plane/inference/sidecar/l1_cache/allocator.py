@@ -56,5 +56,18 @@ class BlockSlotAllocator:
         self._free_ids.append(block_id)
         return True
 
+    def allocate_specific(self, block_id: int) -> bool:
+        """Allocate a specific block ID. Returns False if already allocated or out of range."""
+        if block_id in self._allocated:
+            return True  # already allocated
+        if block_id < 0 or block_id >= self._num_blocks:
+            return False
+        try:
+            self._free_ids.remove(block_id)
+        except ValueError:
+            return False
+        self._allocated.add(block_id)
+        return True
+
     def is_allocated(self, block_id: int) -> bool:
         return block_id in self._allocated
