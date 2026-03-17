@@ -30,6 +30,8 @@ class Engine:
         self.config = config
         self.request_counter = 0
         self.request_futures: Dict[str, asyncio.Future] = {}
+        self.request_queues: Dict[str, asyncio.Queue] = {}
+        self.request_prev_text: Dict[str, str] = {}
         self.request_timings: Dict[str, TimingInfo] = {}
         self.collector = collector
 
@@ -84,6 +86,33 @@ class Engine:
         """Tokenize text using the engine's tokenizer."""
         return self.engine.get_tokenizer().encode(text)
 
+    def _build_sampling_params(
+        self,
+        temperature: Optional[float] = None,
+        max_tokens: Optional[int] = None,
+        top_p: Optional[float] = None,
+        stop: Optional[List[str]] = None,
+        presence_penalty: Optional[float] = None,
+        frequency_penalty: Optional[float] = None,
+        seed: Optional[int] = None,
+    ):
+        from vllm import SamplingParams
+        kwargs: Dict[str, Any] = {}
+        kwargs["temperature"] = temperature if temperature is not None else self.config.temperature
+        if max_tokens is not None:
+            kwargs["max_tokens"] = max_tokens
+        if top_p is not None:
+            kwargs["top_p"] = top_p
+        if stop is not None:
+            kwargs["stop"] = stop
+        if presence_penalty is not None:
+            kwargs["presence_penalty"] = presence_penalty
+        if frequency_penalty is not None:
+            kwargs["frequency_penalty"] = frequency_penalty
+        if seed is not None:
+            kwargs["seed"] = seed
+        return SamplingParams(**kwargs)
+
     async def add_request(
         self,
         prompt: str,
@@ -91,18 +120,23 @@ class Engine:
         adapter_version: Optional[str] = None,
         sampling_params: Optional[Any] = None,
         temperature: Optional[float] = None,
-        max_tokens: Optional[int] = None
+        max_tokens: Optional[int] = None,
+        top_p: Optional[float] = None,
+        stop: Optional[List[str]] = None,
+        presence_penalty: Optional[float] = None,
+        frequency_penalty: Optional[float] = None,
+        seed: Optional[int] = None,
     ):
         if sampling_params is None:
-            from vllm import SamplingParams
-            kwargs = {}
-            if temperature is not None:
-                kwargs["temperature"] = temperature
-            else:
-                kwargs["temperature"] = self.config.temperature
-            if max_tokens is not None:
-                kwargs["max_tokens"] = max_tokens
-            sampling_params = SamplingParams(**kwargs)
+            sampling_params = self._build_sampling_params(
+                temperature=temperature,
+                max_tokens=max_tokens,
+                top_p=top_p,
+                stop=stop,
+                presence_penalty=presence_penalty,
+                frequency_penalty=frequency_penalty,
+                seed=seed,
+            )
 
         request_id = str(self.request_counter)
         self.request_counter += 1
@@ -142,6 +176,81 @@ class Engine:
 
         return await future
 
+    async def add_streaming_request(
+        self,
+        prompt: str,
+        adapter_identifier: Optional[str] = None,
+        adapter_version: Optional[str] = None,
+        temperature: Optional[float] = None,
+        max_tokens: Optional[int] = None,
+        top_p: Optional[float] = None,
+        stop: Optional[List[str]] = None,
+        presence_penalty: Optional[float] = None,
+        frequency_penalty: Optional[float] = None,
+        seed: Optional[int] = None,
+    ) -> asyncio.Queue:
+        """Like add_request but returns an asyncio.Queue that receives token deltas.
+        Each item is a dict: {"token": str, "finish_reason": None|str, "prompt_tokens": int, "completion_tokens": int}
+        None sentinel signals end of stream.
+        """
+        sampling_params = self._build_sampling_params(
+            temperature=temperature,
+            max_tokens=max_tokens,
+            top_p=top_p,
+            stop=stop,
+            presence_penalty=presence_penalty,
+            frequency_penalty=frequency_penalty,
+            seed=seed,
+        )
+
+        request_id = str(self.request_counter)
+        self.request_counter += 1
+
+        queue: asyncio.Queue = asyncio.Queue()
+        self.request_queues[request_id] = queue
+        self.request_prev_text[request_id] = ""
+
+        timing = TimingInfo(
+            submitted_at=time.time(),
+            adapter_id=adapter_identifier,
+            input_tokens=len(self.tokenize(prompt)),
+        )
+
+        lora_request = None
+        if adapter_identifier and self.lora_manager:
+            try:
+                lora_request, swap_duration = await self.lora_manager.ensure_adapter_loaded(
+                    adapter_identifier=adapter_identifier,
+                    adapter_version=adapter_version,
+                )
+                timing.adapter_swap_latency_s = swap_duration
+            except Exception as e:
+                error_msg = f"Failed to load adapter {adapter_identifier} v{adapter_version}: {e}"
+                logger.error(error_msg)
+                await queue.put(None)
+                return queue
+
+        self.request_timings[request_id] = timing
+        self.engine.add_request(request_id, prompt, sampling_params, lora_request=lora_request)
+        return queue
+
+    def apply_chat_template(self, messages: list, add_generation_prompt: bool = True) -> str:
+        """Apply the model's chat template to messages, returning a rendered prompt string."""
+        try:
+            tokenizer = self.engine.get_tokenizer()
+            return tokenizer.apply_chat_template(
+                messages, tokenize=False, add_generation_prompt=add_generation_prompt
+            )
+        except Exception:
+            # Fallback: simple concatenation
+            parts = []
+            for msg in messages:
+                role = msg.get("role", msg.get("role", ""))
+                content = msg.get("content", "")
+                parts.append(f"{role}: {content}")
+            parts.append("assistant:")
+            return "\n".join(parts)
+
     def is_ready(self) -> bool:
         """Check if engine is ready to process requests"""
         return self.engine is not None
@@ -166,6 +275,7 @@ class Engine:
                     request_id = output.request_id
                     timing = self.request_timings.get(request_id)
                     future = self.request_futures.get(request_id)
+                    queue = self.request_queues.get(request_id)
 
                     # Update timing
                     if timing:
@@ -176,6 +286,32 @@ class Engine:
                             timing.first_token_at = now
                         timing.last_step_at = now
                         timing.step_count += 1
+
+                    # Push streaming deltas
+                    if queue is not None:
+                        current_text = output.outputs[0].text
+                        prev_text = self.request_prev_text.get(request_id, "")
+                        delta = current_text[len(prev_text):]
+                        self.request_prev_text[request_id] = current_text
+
+                        if delta:
+                            await queue.put({"token": delta, "finish_reason": None})
+
+                        if output.finished:
+                            finish_reason = "stop"
+                            if hasattr(output.outputs[0], "finish_reason") and output.outputs[0].finish_reason:
+                                finish_reason = output.outputs[0].finish_reason
+                            prompt_tokens = timing.input_tokens if timing else 0
+                            completion_tokens = timing.step_count if timing else 0
+                            await queue.put({
+                                "token": "",
+                                "finish_reason": finish_reason,
+                                "prompt_tokens": prompt_tokens,
+                                "completion_tokens": completion_tokens,
+                            })
+                            await queue.put(None)  # sentinel
+                            del self.request_queues[request_id]
+                            self.request_prev_text.pop(request_id, None)
 
                     if future and not future.done():
                         if output.finished:
