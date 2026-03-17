@@ -13,6 +13,7 @@ from data_plane.inference.sidecar.artifact_manager import ArtifactManager
 from data_plane.inference.sidecar.config import SidecarConfig
 from data_plane.inference.sidecar.kv_block_registry import KVBlockRegistry
 
+logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s [%(name)s] %(message)s")
 logger = logging.getLogger(__name__)
 
 # Global state
@@ -238,6 +239,12 @@ async def load_adapter_route(adapter_identifier: str, version: str = "latest"):
             logger.info(f"Background adapter fetch complete: {adapter_identifier} at {local_path}")
         except Exception as e:
             logger.error(f"Background adapter fetch failed for {adapter_identifier}: {e}")
+            _manager.adapter_registry[adapter_identifier] = {
+                "adapter_id": adapter_identifier,
+                "version": version,
+                "status": "failed",
+                "error": str(e),
+            }
 
     asyncio.create_task(_background_fetch())
 

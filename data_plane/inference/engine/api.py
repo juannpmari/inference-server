@@ -82,12 +82,13 @@ async def _init_engine(config: EngineConfig):
             logger.info("Using REAL vLLM engine")
             model_path = await _wait_for_sidecar_model(config)
             from data_plane.inference.engine.engine import Engine
-            _engine = Engine(config, model_path=model_path)
+            _engine = await asyncio.to_thread(Engine, config, model_path=model_path)
 
+        logger.info(f"_engine set to: {type(_engine)}, id={id(_engine)}")
         _batching_loop = asyncio.create_task(_engine.continuous_batching_loop())
         logger.info("Engine startup complete")
     except Exception as e:
-        logger.error(f"Engine startup failed: {e}")
+        logger.error(f"Engine startup failed: {e}", exc_info=True)
 
 
 @asynccontextmanager
@@ -128,6 +129,7 @@ app = FastAPI(title="Engine", lifespan=lifespan)
 async def health():
     """Health check endpoint"""
     if _engine is None:
+        logger.info(f"Health check: _engine is None, _init_task done={_init_task.done() if _init_task else 'no task'}, _init_task exception={_init_task.exception() if _init_task and _init_task.done() else 'N/A'}")
         return JSONResponse(
             status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
             content={"status": "initializing"}
@@ -191,7 +193,7 @@ async def inference(request: InferenceRequest):
                 temperature=request.temperature,
                 max_tokens=request.max_tokens
             ),
-            timeout=300.0  # 5 minute timeout
+            timeout=_config.sidecar_timeout
         )
 
         duration = time.time() - start_time

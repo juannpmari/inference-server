@@ -68,11 +68,14 @@ class L1ByteStore:
         return ids
 
     def store(self, block_id: int, data: bytes, block_hash: str) -> bool:
-        """Store block bytes at a previously allocated slot."""
+        """Store block bytes. Auto-allocates the slot if not already allocated."""
         start = time.monotonic()
         if not self.allocator.is_allocated(block_id):
-            l1_metrics.l1_cache_operations_total.labels(op="store", status="error").inc()
-            return False
+            # Auto-allocate: the engine-side backend tracks its own IDs
+            # and may store without a prior AllocateBlocks RPC.
+            if not self.allocator.allocate_specific(block_id):
+                l1_metrics.l1_cache_operations_total.labels(op="store", status="error").inc()
+                return False
 
         self._data[block_id] = data
         self._id_to_hash[block_id] = block_hash

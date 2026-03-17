@@ -4,12 +4,14 @@ import redis.asyncio as redis
 import time
 from typing import Optional, Tuple, NamedTuple
 
+from shared.config_loader import get_config
+
 # --- Configuration for this specific node ---
-# NOTE: In a Kubernetes setup, these are configured for the specific pod.
-NODE_ID = "redis-0" # Identifier used by the KVCache Watcher
-REDIS_HOST = "localhost" # Assumes a Redis server is running locally or accessible
-REDIS_PORT = 6379 
-WATCHER_ADDR = "kv-cache-watcher:50051" # Address of the Controller
+_dc_cfg = get_config("distributed_cache")
+NODE_ID = _dc_cfg.get("storage_node_id", "redis-0")
+REDIS_HOST = _dc_cfg.get("storage_redis_host", "localhost")
+REDIS_PORT = _dc_cfg.get("storage_redis_port", 6379)
+WATCHER_ADDR = _dc_cfg.get("watcher_service_addr", "kv-cache-watcher:50051")
 
 # --- Type Definitions ---
 class StorageStatus(NamedTuple):

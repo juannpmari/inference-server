@@ -2,18 +2,25 @@ FROM python:3.12-slim AS base
 
 WORKDIR /app
 
-# Install uv for fast dependency management
-RUN pip install --no-cache-dir uv
+# Install uv via curl-based installer
+RUN apt-get update && apt-get install -y --no-install-recommends curl && \
+    curl -LsSf https://astral.sh/uv/install.sh | sh && \
+    rm -rf /var/lib/apt/lists/*
+ENV PATH="/root/.local/bin:$PATH"
 
-# Copy project metadata and dependency files
-COPY pyproject.toml README.md uv.lock* ./
+# Copy only dependency metadata first (cache-friendly layer)
+COPY pyproject.toml uv.lock ./
 
-# Copy application code
+# Create a minimal README.md so pyproject.toml metadata is valid
+RUN touch README.md
+
+# Install production dependencies (gateway only — no CUDA/ML libs)
+RUN uv sync --no-dev --extra gateway
+
+# Copy application code and config
+COPY server_config.yaml ./
 COPY shared/ ./shared/
-COPY data_plane/ ./data_plane/
-
-# Install production dependencies
-RUN uv sync --no-dev
+COPY data_plane/gateway/ ./data_plane/gateway/
 
 EXPOSE 8000
 

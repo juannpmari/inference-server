@@ -6,12 +6,13 @@ import grpc
 
 from data_plane.inference.sidecar.cache_manager import MultiTieredCacheManager
 from data_plane.inference.sidecar.kv_cache_api import KVCacheServicer
+from shared.config_loader import get_config
 from shared.proto import kv_cache_pb2_grpc
 
 logger = logging.getLogger(__name__)
 
-# 16 MB max message size (KV blocks can be large)
-_MAX_MESSAGE_SIZE = 16 * 1024 * 1024
+_grpc_cfg = get_config("grpc")
+_MAX_MESSAGE_SIZE = _grpc_cfg.get("max_message_size", 16 * 1024 * 1024)
 
 _GRPC_OPTIONS = [
     ("grpc.max_send_message_length", _MAX_MESSAGE_SIZE),

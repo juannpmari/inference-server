@@ -5,7 +5,7 @@ import logging
 
 try:
     from vllm import EngineArgs, LLMEngine, SamplingParams
-    from vllm.utils import FlexibleArgumentParser
+    from vllm.engine.arg_utils import FlexibleArgumentParser
     VLLM_AVAILABLE = True
 except ImportError:
     VLLM_AVAILABLE = False
@@ -27,9 +27,6 @@ class Engine:
         self.config = config
         self.request_counter = 0
         self.request_futures: Dict[str, asyncio.Future] = {}
-
-        from vllm.utils import FlexibleArgumentParser
-        from vllm import EngineArgs
 
         parser = FlexibleArgumentParser()
         parser = EngineArgs.add_cli_args(parser)
@@ -64,7 +61,6 @@ class Engine:
             ])
 
         args = parser.parse_args(cli_args_list)
-        from vllm import EngineArgs, SamplingParams
         engine_args = EngineArgs.from_cli_args(args)
         self.sampling_params = SamplingParams(temperature=config.temperature)
 
@@ -89,11 +85,15 @@ class Engine:
         max_tokens: Optional[int] = None
     ):
         if sampling_params is None:
+            from vllm import SamplingParams
+            kwargs = {}
             if temperature is not None:
-                from vllm import SamplingParams
-                sampling_params = SamplingParams(temperature=temperature)
+                kwargs["temperature"] = temperature
             else:
-                sampling_params = self.sampling_params
+                kwargs["temperature"] = self.config.temperature
+            if max_tokens is not None:
+                kwargs["max_tokens"] = max_tokens
+            sampling_params = SamplingParams(**kwargs)
 
         request_id = str(self.request_counter)
         self.request_counter += 1
@@ -114,6 +114,11 @@ class Engine:
                 future.set_exception(RuntimeError(error_msg))
                 return await future
 
+        if lora_request:                                                                                                                      
+            logger.info(f"Submitting request {request_id} WITH adapter: {lora_request.lora_name} (id={lora_request.lora_int_id}, path={lora_request.lora_path})")                                                                                                      
+        else:           
+            logger.info(f"Submitting request {request_id} with base model only")
+            
         self.engine.add_request(request_id, prompt, sampling_params, lora_request=lora_request)
 
         return await future
