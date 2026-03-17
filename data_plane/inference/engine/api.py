@@ -2,6 +2,7 @@ import asyncio
 import logging
 from contextlib import asynccontextmanager
 from typing import Optional
+from uuid import uuid4
 
 import httpx
 from fastapi import FastAPI, HTTPException, status
@@ -12,6 +13,9 @@ import time
 
 from data_plane.inference.engine.config import EngineConfig
 from data_plane.inference.engine import metrics
+from shared.monitoring import SessionCollector, TimingInfo, RequestRecord
+from shared.monitoring.gpu import GPUMonitor
+from shared.monitoring.storage import LocalJSONLStore, BackgroundFlusher
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s [%(name)s] %(message)s")
 logger = logging.getLogger(__name__)
@@ -37,6 +41,9 @@ _engine = None
 _batching_loop = None
 _init_task = None
 _config = None
+_collector: Optional[SessionCollector] = None
+_gpu_monitor: Optional[GPUMonitor] = None
+_flusher: Optional[BackgroundFlusher] = None
 
 
 async def _wait_for_sidecar_model(config: EngineConfig) -> str:
@@ -77,12 +84,12 @@ async def _init_engine(config: EngineConfig):
         if config.enable_engine_mock:
             logger.info("Using MOCK engine (no GPU)")
             from data_plane.inference.engine.mock_engine import MockLLMEngine
-            _engine = MockLLMEngine(config)
+            _engine = MockLLMEngine(config, collector=_collector)
         else:
             logger.info("Using REAL vLLM engine")
             model_path = await _wait_for_sidecar_model(config)
             from data_plane.inference.engine.engine import Engine
-            _engine = await asyncio.to_thread(Engine, config, model_path=model_path)
+            _engine = await asyncio.to_thread(Engine, config, model_path=model_path, collector=_collector)
 
         logger.info(f"_engine set to: {type(_engine)}, id={id(_engine)}")
         _batching_loop = asyncio.create_task(_engine.continuous_batching_loop())
@@ -91,13 +98,54 @@ async def _init_engine(config: EngineConfig):
         logger.error(f"Engine startup failed: {e}", exc_info=True)
 
 
+def _gpu_on_sample(snapshot: dict):
+    """Callback from GPUMonitor to update Prometheus gauges."""
+    metrics.engine_gpu_compute_utilization_percent.labels(device="0").set(snapshot["compute_utilization_pct"])
+    metrics.engine_gpu_memory_used_bytes.labels(device="0").set(snapshot["memory_used_bytes"])
+    metrics.engine_gpu_memory_total_bytes.labels(device="0").set(snapshot["memory_total_bytes"])
+    metrics.engine_gpu_power_watts.labels(device="0").set(snapshot["power_watts"])
+
+
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     logger.info("Starting engine...")
-    global _init_task, _config
+    global _init_task, _config, _collector, _gpu_monitor, _flusher
     _config = EngineConfig()
 
-    # Launch init in background so the server starts accepting requests immediately
+    # Initialize monitoring
+    def _lora_state():
+        if _engine and hasattr(_engine, 'lora_manager') and _engine.lora_manager:
+            return {
+                "loaded_count": _engine.lora_manager.loaded_count,
+                "loaded_keys": _engine.lora_manager.loaded_keys,
+            }
+        return {"loaded_count": 0, "loaded_keys": []}
+
+    _collector = SessionCollector(
+        maxlen=_config.monitoring_buffer_size,
+        lora_state_fn=_lora_state,
+    )
+
+    # GPU monitoring
+    if _config.gpu_monitor_enabled:
+        _gpu_monitor = GPUMonitor(
+            poll_interval=_config.gpu_poll_interval,
+            device_index=_config.gpu_device_index,
+            on_sample=_gpu_on_sample,
+        )
+        _gpu_monitor.start()
+        logger.info(f"GPUMonitor started (available={_gpu_monitor.available})")
+
+    # Storage persistence
+    store = LocalJSONLStore(_config.monitoring_local_store_path)
+    _flusher = BackgroundFlusher(
+        collector=_collector,
+        backend=store,
+        interval=_config.monitoring_flush_interval,
+    )
+    _flusher.start()
+
+    # Launch engine init in background so the server starts accepting requests immediately
     _init_task = asyncio.create_task(_init_engine(_config))
 
     yield
@@ -105,6 +153,10 @@ async def lifespan(app: FastAPI):
     # Shutdown
     try:
         logger.info("Shutting down engine...")
+        if _flusher:
+            await _flusher.stop()
+        if _gpu_monitor:
+            await _gpu_monitor.stop()
         if _init_task and not _init_task.done():
             _init_task.cancel()
             try:
@@ -173,6 +225,8 @@ async def inference(request: InferenceRequest):
             detail="Model not ready"
         )
 
+    model_id = _config.model_name
+
     if len(_engine.request_futures) >= _config.max_pending:
         raise HTTPException(
             status_code=status.HTTP_429_TOO_MANY_REQUESTS,
@@ -180,9 +234,13 @@ async def inference(request: InferenceRequest):
             headers={"Retry-After": "1"}
         )
 
+    # Queue depth tracking
+    if _collector:
+        _collector.inc_queue_depth()
+    metrics.engine_pending_requests.labels(model=model_id).inc()
+
     try:
         start_time = time.time()
-        model_id = _config.model_name
 
         # Add request to engine
         result = await asyncio.wait_for(
@@ -202,10 +260,15 @@ async def inference(request: InferenceRequest):
         metrics.engine_requests_total.labels(model=model_id, status="success").inc()
         metrics.engine_request_duration_seconds.labels(model=model_id).observe(duration)
 
-        # Parse result to count tokens
-        tokens_generated = len(result.split()) if isinstance(result, str) else 0
+        # Accurate token counting
+        tokens_generated = len(_engine.tokenize(result)) if isinstance(result, str) else 0
+        input_tokens = len(_engine.tokenize(request.prompt))
 
         metrics.engine_tokens_generated_total.labels(model=model_id).inc(tokens_generated)
+
+        # LoRA per-adapter counter
+        if request.adapter_identifier:
+            metrics.engine_lora_requests_total.labels(adapter=request.adapter_identifier).inc()
 
         return InferenceResponse(
             text=result,
@@ -214,21 +277,60 @@ async def inference(request: InferenceRequest):
         )
 
     except asyncio.TimeoutError:
-        metrics.engine_requests_total.labels(model=_config.model_name, status="timeout").inc()
+        metrics.engine_requests_total.labels(model=model_id, status="timeout").inc()
         raise HTTPException(
             status_code=status.HTTP_504_GATEWAY_TIMEOUT,
             detail="Request generation timed out"
         )
     except Exception as e:
         logger.error(f"Inference error: {e}")
-        metrics.engine_requests_total.labels(model=_config.model_name, status="error").inc()
+        metrics.engine_requests_total.labels(model=model_id, status="error").inc()
         raise HTTPException(
             status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
             detail=f"Generation failed: {str(e)}"
         )
+    finally:
+        if _collector:
+            _collector.dec_queue_depth()
+        metrics.engine_pending_requests.labels(model=model_id).dec()
 
 
 @app.get("/metrics", tags=["monitoring"])
 async def metrics_endpoint():
     """Prometheus metrics endpoint"""
     return Response(content=generate_latest(REGISTRY), media_type="text/plain; charset=utf-8")
+
+
+@app.get("/metrics_summary", tags=["monitoring"])
+async def metrics_summary():
+    """Aggregated metrics summary endpoint."""
+    if _collector is None:
+        raise HTTPException(
+            status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+            detail="Monitoring not initialized"
+        )
+
+    model_id = _config.model_name if _config else None
+    summary = _collector.get_summary(model_id=model_id)
+
+    # Merge GPU data
+    if _gpu_monitor:
+        gpu_summary = _gpu_monitor.get_summary()
+        summary["gpu"] = gpu_summary
+        # Compute tokens_per_watt
+        output_tps = summary.get("throughput", {}).get("output_tokens_per_second", 0.0)
+        power = gpu_summary.get("current", {}).get("power_watts", 0.0)
+        summary["gpu"]["tokens_per_watt"] = round(output_tps / power, 4) if power > 0 else 0.0
+
+    # Merge KV cache data from sidecar (graceful degradation)
+    if _config and _config.sidecar_url:
+        try:
+            async with httpx.AsyncClient(timeout=3.0) as client:
+                resp = await client.get(f"{_config.sidecar_url}/cache/stats")
+                if resp.status_code == 200:
+                    summary["kv_cache"] = resp.json()
+        except Exception as e:
+            logger.warning(f"Failed to fetch sidecar cache stats: {e}")
+            # kv_cache stays as empty dict from collector
+
+    return summary

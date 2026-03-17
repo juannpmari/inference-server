@@ -66,6 +66,7 @@ class LoRAManager:
         self._pending_downloads: Dict[str, asyncio.Event] = {}
 
         self._lock = asyncio.Lock()
+        self._last_swap_duration: float = 0.0
 
     @staticmethod
     def _adapter_key(identifier: str, version: Optional[str]) -> str:
@@ -89,11 +90,11 @@ class LoRAManager:
         version = adapter_version or "latest"
         key = self._adapter_key(adapter_identifier, version)
 
-        # Fast path: already loaded on GPU
+        # Fast path: already loaded on GPU (0.0 swap duration = cache hit)
         async with self._lock:
             if key in self._loaded:
                 self._loaded.move_to_end(key)
-                return self._make_lora_request(self._loaded[key])
+                return self._make_lora_request(self._loaded[key]), 0.0
 
             # Check if another coroutine is already fetching this adapter
             if key in self._pending_downloads:
@@ -125,7 +126,7 @@ class LoRAManager:
                     f"Adapter {adapter_identifier} v{version} failed to load"
                 )
             self._loaded.move_to_end(key)
-            return self._make_lora_request(self._loaded[key])
+            return self._make_lora_request(self._loaded[key]), self._last_swap_duration
 
     async def _trigger_and_poll(self, identifier: str, version: str, key: str):
         """Trigger sidecar download, poll until ready, evict if needed, load to GPU."""
@@ -162,6 +163,7 @@ class LoRAManager:
         await asyncio.to_thread(self._engine.add_lora, lora_request)
         duration = time.time() - start
 
+        self._last_swap_duration = duration
         metrics.engine_lora_load_duration_seconds.labels(adapter=identifier).observe(duration)
         metrics.engine_lora_active.inc()
 

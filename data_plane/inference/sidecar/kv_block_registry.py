@@ -23,6 +23,8 @@ class KVBlockRegistry:
         self._hits = 0
         self._misses = 0
         self._evictions = 0
+        self._eviction_window_start = time.time()
+        self._l1_capacity_bytes: int = 0  # Set externally if known
         self._load_from_disk()
 
     def register(self, entry: KVBlockEntry) -> None:
@@ -78,14 +80,21 @@ class KVBlockRegistry:
         l1_blocks = [e for e in self._blocks.values() if e.location == "L1"]
         l2_blocks = [e for e in self._blocks.values() if e.location == "L2"]
         total_lookups = self._hits + self._misses
+        l1_used = sum(e.size_bytes for e in l1_blocks)
+        elapsed = time.time() - self._eviction_window_start
+        eviction_rate = self._evictions / elapsed if elapsed > 0 else 0.0
+        l1_util = l1_used / self._l1_capacity_bytes if self._l1_capacity_bytes > 0 else 0.0
         return {
             "total_blocks": len(self._blocks),
             "l1_blocks": len(l1_blocks),
             "l2_blocks": len(l2_blocks),
-            "l1_used_bytes": sum(e.size_bytes for e in l1_blocks),
+            "l1_used_bytes": l1_used,
+            "l1_capacity_bytes": self._l1_capacity_bytes,
+            "l1_utilization_ratio": round(l1_util, 4),
             "l2_used_bytes": sum(e.size_bytes for e in l2_blocks),
             "hit_rate": self._hits / total_lookups if total_lookups > 0 else 0.0,
             "eviction_count": self._evictions,
+            "eviction_rate": round(eviction_rate, 4),
         }
 
     def _persist_to_disk(self) -> None:

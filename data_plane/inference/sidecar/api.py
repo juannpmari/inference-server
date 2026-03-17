@@ -31,6 +31,7 @@ async def lifespan(app: FastAPI):
     _config = SidecarConfig()
     _manager = ArtifactManager(config=_config)
     _kv_registry = KVBlockRegistry()
+    _kv_registry._l1_capacity_bytes = _config.l1_num_blocks * _config.l1_block_size_bytes
 
     # Start gRPC KV cache server
     from data_plane.inference.sidecar.cache_manager import MultiTieredCacheManager

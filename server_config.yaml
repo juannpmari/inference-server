@@ -35,6 +35,15 @@ engine:
   enable_kv_offload: false
   kv_offload_num_blocks: 1024
   enable_engine_mock: false
+  # GPU monitoring
+  gpu_monitor_enabled: true
+  gpu_poll_interval: 2.0          # seconds
+  gpu_device_index: 0
+  # Metrics persistence
+  monitoring_storage_backend: "local"
+  monitoring_local_store_path: "/mnt/models/metrics.jsonl"
+  monitoring_buffer_size: 10000
+  monitoring_flush_interval: 30    # seconds
 
 # --- Sidecar ---
 sidecar:

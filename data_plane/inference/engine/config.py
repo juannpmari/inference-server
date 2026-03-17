@@ -36,6 +36,17 @@ class EngineConfig(BaseSettings):
         description="Set to true to use mock engine (no GPU needed)",
     )
 
+    # GPU monitoring
+    gpu_monitor_enabled: bool = True
+    gpu_poll_interval: float = 2.0
+    gpu_device_index: int = 0
+
+    # Metrics persistence
+    monitoring_storage_backend: str = "local"
+    monitoring_local_store_path: str = "/mnt/models/metrics.jsonl"
+    monitoring_buffer_size: int = 10000
+    monitoring_flush_interval: float = 30.0
+
     @classmethod
     def settings_customise_sources(cls, settings_cls, **kwargs):
         return (
