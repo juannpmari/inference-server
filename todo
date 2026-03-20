@@ -1,0 +1,18 @@
+- fix LLMEngine instance creation and all config params
+- el container de Engine está siempre correindo con un modelo cargado, etnocnes llega la request y solo la procesa. Pero como hacer si es un modelo poco usado, para no tenerlo ocupando memory gpu?
+- think how to route based on gpu utilization (choose correct replica)
+- check asyncLLMEngine instead of LLMEngine (https://docs.vllm.ai/en/v0.6.4/dev/engine/async_llm_engine.html)
+- check if unload_model unloads the model from gpu vram; check vLLM's Sleep Mode
+- implement Cache-and-Wait Synchronization (see https://gemini.google.com/app/ae080eacb2134e9a)
+
+Next steps:
+- LoRA support - done
+- KV cache (single node) - isn't it already implemented in LLMEngine? or do i have to implement it myself? - done
+    - this would be the L1 cache
+- KV cache (distributed) - done
+    - this would be the L2 cache
+- hacer diagrama de todo y validar con el codigo real de aibrix
+- support for streaming
+- investigate control plane features
+- Engine Runtime (see https://aibrix.readthedocs.io/latest/designs/aibrix-engine-runtime.html)
+- ver https://github.com/bytedance/InfiniStore
