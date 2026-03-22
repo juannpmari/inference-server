@@ -25,6 +25,11 @@ class InferenceRequest(BaseModel):
     prompt: str = Field(..., min_length=1, description="Input prompt")
     max_tokens: int = Field(default=256, ge=1, le=4096, description="Maximum tokens to generate")
     temperature: float = Field(default=0.7, ge=0.0, le=2.0, description="Sampling temperature")
+    top_p: float = Field(default=1.0, ge=0.0, le=1.0, description="Nucleus sampling")
+    stop: Optional[list[str]] = Field(default=None, description="Stop sequences")
+    presence_penalty: float = Field(default=0.0, ge=-2.0, le=2.0, description="Presence penalty")
+    frequency_penalty: float = Field(default=0.0, ge=-2.0, le=2.0, description="Frequency penalty")
+    seed: Optional[int] = Field(default=None, description="Random seed for reproducibility")
     stream: bool = Field(default=False, description="Stream tokens as they're generated")
     adapter_identifier: Optional[str] = Field(default=None, description="LoRA adapter ID")
     adapter_version: Optional[str] = Field(default=None, description="LoRA adapter version")
@@ -34,6 +39,8 @@ class InferenceResponse(BaseModel):
     text: str
     tokens_generated: int
     duration_seconds: float
+    prompt_tokens: int = 0
+    finish_reason: str = "stop"
 
 
 # Global state
@@ -207,34 +214,33 @@ async def ready():
     return {"status": "ready"}
 
 
-@app.post("/inference", response_model=InferenceResponse, tags=["inference"])
-async def inference(request: InferenceRequest):
-    """
-    Generate text from a prompt.
-    Validates input and handles errors gracefully.
-    """
+def _check_engine_ready():
+    """Raise HTTPException if engine is not ready."""
     if _engine is None:
         raise HTTPException(
             status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
             detail="Engine not initialized"
         )
-
     if not _engine.is_ready():
         raise HTTPException(
             status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
             detail="Model not ready"
         )
-
-    model_id = _config.model_name
-
-    if len(_engine.request_futures) >= _config.max_pending:
+    if len(_engine.request_futures) + len(getattr(_engine, "request_queues", {})) >= _config.max_pending:
         raise HTTPException(
             status_code=status.HTTP_429_TOO_MANY_REQUESTS,
             detail="Queue full, too many pending requests",
-            headers={"Retry-After": "1"}
+            headers={"Retry-After": "1"},
         )
 
-    # Queue depth tracking
+
+@app.post("/generate", response_model=InferenceResponse, tags=["inference"])
+async def generate(request: InferenceRequest):
+    """Generate text from a prompt (internal endpoint called by gateway)."""
+    _check_engine_ready()
+
+    model_id = _config.model_name
+
     if _collector:
         _collector.inc_queue_depth()
     metrics.engine_pending_requests.labels(model=model_id).inc()
@@ -242,57 +248,109 @@ async def inference(request: InferenceRequest):
     try:
         start_time = time.time()
 
-        # Add request to engine
         result = await asyncio.wait_for(
             _engine.add_request(
                 prompt=request.prompt,
                 adapter_identifier=request.adapter_identifier,
                 adapter_version=request.adapter_version,
                 temperature=request.temperature,
-                max_tokens=request.max_tokens
+                max_tokens=request.max_tokens,
+                top_p=request.top_p,
+                stop=request.stop,
+                presence_penalty=request.presence_penalty,
+                frequency_penalty=request.frequency_penalty,
+                seed=request.seed,
             ),
-            timeout=_config.sidecar_timeout
+            timeout=_config.sidecar_timeout,
         )
 
         duration = time.time() - start_time
 
-        # Record metrics
         metrics.engine_requests_total.labels(model=model_id, status="success").inc()
         metrics.engine_request_duration_seconds.labels(model=model_id).observe(duration)
 
-        # Accurate token counting
         tokens_generated = len(_engine.tokenize(result)) if isinstance(result, str) else 0
         input_tokens = len(_engine.tokenize(request.prompt))
 
         metrics.engine_tokens_generated_total.labels(model=model_id).inc(tokens_generated)
 
-        # LoRA per-adapter counter
         if request.adapter_identifier:
             metrics.engine_lora_requests_total.labels(adapter=request.adapter_identifier).inc()
 
         return InferenceResponse(
             text=result,
             tokens_generated=tokens_generated,
-            duration_seconds=duration
+            duration_seconds=duration,
+            prompt_tokens=input_tokens,
+            finish_reason="stop",
         )
 
     except asyncio.TimeoutError:
         metrics.engine_requests_total.labels(model=model_id, status="timeout").inc()
         raise HTTPException(
             status_code=status.HTTP_504_GATEWAY_TIMEOUT,
-            detail="Request generation timed out"
+            detail="Request generation timed out",
         )
     except Exception as e:
         logger.error(f"Inference error: {e}")
         metrics.engine_requests_total.labels(model=model_id, status="error").inc()
         raise HTTPException(
             status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
-            detail=f"Generation failed: {str(e)}"
+            detail=f"Generation failed: {str(e)}",
         )
     finally:
         if _collector:
             _collector.dec_queue_depth()
         metrics.engine_pending_requests.labels(model=model_id).dec()
+
+
+@app.post("/generate/stream", tags=["inference"])
+async def generate_stream(request: InferenceRequest):
+    """Stream tokens via SSE (internal endpoint called by gateway)."""
+    _check_engine_ready()
+
+    import json as _json
+
+    async def _event_generator():
+        queue = await _engine.add_streaming_request(
+            prompt=request.prompt,
+            adapter_identifier=request.adapter_identifier,
+            adapter_version=request.adapter_version,
+            temperature=request.temperature,
+            max_tokens=request.max_tokens,
+            top_p=request.top_p,
+            stop=request.stop,
+            presence_penalty=request.presence_penalty,
+            frequency_penalty=request.frequency_penalty,
+            seed=request.seed,
+        )
+        while True:
+            item = await queue.get()
+            if item is None:
+                yield "data: [DONE]\n\n"
+                break
+            yield f"data: {_json.dumps(item)}\n\n"
+
+    return StreamingResponse(_event_generator(), media_type="text/event-stream")
+
+
+class ChatTemplateRequest(BaseModel):
+    messages: list[dict] = Field(..., description="List of chat messages")
+    add_generation_prompt: bool = Field(default=True)
+
+
+class ChatTemplateResponse(BaseModel):
+    prompt: str
+
+
+@app.post("/chat/apply_template", response_model=ChatTemplateResponse, tags=["inference"])
+async def apply_template(request: ChatTemplateRequest):
+    """Render messages through the model's chat template."""
+    _check_engine_ready()
+    prompt = _engine.apply_chat_template(
+        request.messages, add_generation_prompt=request.add_generation_prompt
+    )
+    return ChatTemplateResponse(prompt=prompt)
 
 
 @app.get("/metrics", tags=["monitoring"])

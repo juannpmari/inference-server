@@ -163,6 +163,57 @@ class TestInferenceRequest:
         assert req.stream == True
         assert req.adapter_identifier == "test-adapter"
 
+    def test_request_new_sampling_fields(self):
+        """Test new sampling parameter fields"""
+        req = InferenceRequest(
+            prompt="test",
+            top_p=0.9,
+            stop=["END"],
+            presence_penalty=0.5,
+            frequency_penalty=0.3,
+            seed=42,
+        )
+        assert req.top_p == 0.9
+        assert req.stop == ["END"]
+        assert req.presence_penalty == 0.5
+        assert req.frequency_penalty == 0.3
+        assert req.seed == 42
+
+
+class TestMockEngineStreaming:
+    """Tests for mock engine streaming support"""
+
+    @pytest.mark.asyncio
+    async def test_streaming_returns_tokens(self, mock_engine):
+        """Test streaming produces token deltas then sentinel"""
+        queue = await mock_engine.add_streaming_request(prompt="hello world")
+        tokens = []
+        while True:
+            item = await queue.get()
+            if item is None:
+                break
+            tokens.append(item)
+
+        # Should have at least one content token and one final token
+        assert len(tokens) >= 2
+        # Last item should have finish_reason
+        assert tokens[-1]["finish_reason"] == "stop"
+        # Reconstruct text
+        text = "".join(t["token"] for t in tokens)
+        assert len(text) > 0
+
+    @pytest.mark.asyncio
+    async def test_chat_template(self, mock_engine):
+        """Test chat template rendering"""
+        messages = [
+            {"role": "system", "content": "You are helpful."},
+            {"role": "user", "content": "Hi"},
+        ]
+        prompt = mock_engine.apply_chat_template(messages)
+        assert "system: You are helpful." in prompt
+        assert "user: Hi" in prompt
+        assert prompt.endswith("assistant:")
+
 
 class TestEngineAPI:
     """Tests for the FastAPI endpoints"""

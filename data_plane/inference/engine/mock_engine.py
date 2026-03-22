@@ -52,6 +52,7 @@ class MockLLMEngine:
         self.request_counter = 0
         self.request_futures: Dict[str, asyncio.Future] = {}
         self.request_timings: Dict[str, TimingInfo] = {}
+        self.request_queues: Dict[str, asyncio.Queue] = {}
         self.pending_requests = {}
         self.finished_requests = []
         self.collector = collector
@@ -95,7 +96,12 @@ class MockLLMEngine:
         adapter_version: Optional[str] = None,
         sampling_params=None,
         temperature: Optional[float] = None,
-        max_tokens: Optional[int] = None
+        max_tokens: Optional[int] = None,
+        top_p: Optional[float] = None,
+        stop: Optional[list[str]] = None,
+        presence_penalty: Optional[float] = None,
+        frequency_penalty: Optional[float] = None,
+        seed: Optional[int] = None,
     ):
         """Add a request to the mock engine"""
         request_id = str(self.request_counter)
@@ -140,6 +146,52 @@ class MockLLMEngine:
         asyncio.get_running_loop().call_soon(self._resolve_pending)
 
         return await future
+
+    async def add_streaming_request(
+        self,
+        prompt: str,
+        adapter_identifier: Optional[str] = None,
+        adapter_version: Optional[str] = None,
+        temperature: Optional[float] = None,
+        max_tokens: Optional[int] = None,
+        top_p: Optional[float] = None,
+        stop: Optional[list[str]] = None,
+        presence_penalty: Optional[float] = None,
+        frequency_penalty: Optional[float] = None,
+        seed: Optional[int] = None,
+    ) -> asyncio.Queue:
+        """Return an asyncio.Queue that yields mock token deltas then a None sentinel."""
+        queue: asyncio.Queue = asyncio.Queue()
+        response_text = self._generate_mock_response(prompt)
+        input_tokens = len(self.tokenize(prompt))
+
+        async def _produce():
+            words = response_text.split(" ")
+            for i, word in enumerate(words):
+                token = word if i == 0 else " " + word
+                await queue.put({"token": token, "finish_reason": None})
+                await asyncio.sleep(0.001)
+            await queue.put({
+                "token": "",
+                "finish_reason": "stop",
+                "prompt_tokens": input_tokens,
+                "completion_tokens": len(words),
+            })
+            await queue.put(None)
+
+        asyncio.create_task(_produce())
+        return queue
+
+    def apply_chat_template(self, messages: list, add_generation_prompt: bool = True) -> str:
+        """Simple concatenation fallback for mock engine."""
+        parts = []
+        for msg in messages:
+            role = msg.get("role", "")
+            content = msg.get("content", "")
+            parts.append(f"{role}: {content}")
+        if add_generation_prompt:
+            parts.append("assistant:")
+        return "\n".join(parts)
 
     def _resolve_pending(self):
         """Resolve all pending request futures immediately."""
