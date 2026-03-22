@@ -49,6 +49,24 @@ class TestOpenAITypes:
         assert req.top_p == 1.0
         assert req.stream is False
         assert req.n == 1
+        assert req.adapter_identifier is None
+
+    def test_chat_completion_request_with_adapter(self):
+        req = ChatCompletionRequest(
+            model="test-model",
+            messages=[ChatMessage(role="user", content="Hi")],
+            adapter_identifier="my-org/my-lora",
+            adapter_version="v1",
+        )
+        assert req.adapter_identifier == "my-org/my-lora"
+        assert req.adapter_version == "v1"
+
+    def test_completion_request_with_adapter(self):
+        req = CompletionRequest(
+            model="test", prompt="Hello",
+            adapter_identifier="my-adapter",
+        )
+        assert req.adapter_identifier == "my-adapter"
 
     def test_completion_request_defaults(self):
         req = CompletionRequest(model="test", prompt="Hello")
@@ -153,9 +171,9 @@ class MockTransport(httpx.AsyncBaseTransport):
         self.calls = []
 
     async def handle_async_request(self, request: httpx.Request) -> httpx.Response:
-        self.calls.append(str(request.url))
         url = str(request.url)
         body = json.loads(request.content) if request.content else {}
+        self.calls.append({"url": url, "body": body})
 
         if "/chat/apply_template" in url:
             return httpx.Response(200, json=_make_template_response())
@@ -175,15 +193,18 @@ class MockTransport(httpx.AsyncBaseTransport):
 
 
 @pytest.fixture
-def gateway_client():
+def mock_transport():
+    return MockTransport()
+
+
+@pytest.fixture
+def gateway_client(mock_transport):
     """Create a TestClient for the gateway app with mocked httpx clients."""
     from data_plane.gateway.routing import app
 
-    transport = MockTransport()
-    mock_client = httpx.AsyncClient(transport=transport)
+    mock_client = httpx.AsyncClient(transport=mock_transport)
 
     with TestClient(app) as client:
-        # Patch the http clients used by the gateway
         app.state.http_client = mock_client
         app.state.stream_client = mock_client
         yield client
@@ -237,6 +258,20 @@ class TestGatewayCompletions:
         assert resp.status_code == 404
         assert "error" in resp.json()
 
+    def test_completions_with_adapter(self, gateway_client, mock_transport):
+        from data_plane.gateway.routing import MODEL_SERVICE_MAP
+        model_id = list(MODEL_SERVICE_MAP.keys())[0]
+        resp = gateway_client.post("/v1/completions", json={
+            "model": model_id,
+            "prompt": "Hello",
+            "adapter_identifier": "my-org/my-lora",
+            "adapter_version": "v2",
+        })
+        assert resp.status_code == 200
+        generate_call = [c for c in mock_transport.calls if "/generate" in c["url"] and "/stream" not in c["url"]][0]
+        assert generate_call["body"]["adapter_identifier"] == "my-org/my-lora"
+        assert generate_call["body"]["adapter_version"] == "v2"
+
 
 class TestGatewayChatCompletions:
     def test_chat_completions_non_streaming(self, gateway_client):
@@ -269,6 +304,18 @@ class TestGatewayChatCompletions:
             "seed": 42,
         })
         assert resp.status_code == 200
+
+    def test_chat_completions_with_adapter(self, gateway_client, mock_transport):
+        from data_plane.gateway.routing import MODEL_SERVICE_MAP
+        model_id = list(MODEL_SERVICE_MAP.keys())[0]
+        resp = gateway_client.post("/v1/chat/completions", json={
+            "model": model_id,
+            "messages": [{"role": "user", "content": "Hello"}],
+            "adapter_identifier": "my-org/chat-lora",
+        })
+        assert resp.status_code == 200
+        generate_call = [c for c in mock_transport.calls if "/generate" in c["url"] and "/stream" not in c["url"]][0]
+        assert generate_call["body"]["adapter_identifier"] == "my-org/chat-lora"
 
     def test_chat_completions_tool_calls_rejected(self, gateway_client):
         from data_plane.gateway.routing import MODEL_SERVICE_MAP

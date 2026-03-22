@@ -33,6 +33,9 @@ class ChatCompletionRequest(BaseModel):
     user: Optional[str] = None
     response_format: Optional[dict[str, str]] = None
     seed: Optional[int] = None
+    # Non-standard: LoRA adapter selection (pass via extra_body in OpenAI SDK)
+    adapter_identifier: Optional[str] = None
+    adapter_version: Optional[str] = None
 
 
 class CompletionRequest(BaseModel):
@@ -47,6 +50,9 @@ class CompletionRequest(BaseModel):
     presence_penalty: float = Field(default=0.0, ge=-2.0, le=2.0)
     frequency_penalty: float = Field(default=0.0, ge=-2.0, le=2.0)
     seed: Optional[int] = None
+    # Non-standard: LoRA adapter selection (pass via extra_body in OpenAI SDK)
+    adapter_identifier: Optional[str] = None
+    adapter_version: Optional[str] = None
 
 
 # ---------------------------------------------------------------------------

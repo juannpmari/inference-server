@@ -153,6 +153,16 @@ def _sampling_kwargs(
     return d
 
 
+def _adapter_kwargs(adapter_identifier=None, adapter_version=None) -> dict:
+    """Build adapter kwargs for the engine request."""
+    d: dict = {}
+    if adapter_identifier is not None:
+        d["adapter_identifier"] = adapter_identifier
+    if adapter_version is not None:
+        d["adapter_version"] = adapter_version
+    return d
+
+
 # ---------------------------------------------------------------------------
 # POST /v1/completions
 # ---------------------------------------------------------------------------
@@ -167,7 +177,8 @@ async def create_completion(request: CompletionRequest):
         frequency_penalty=request.frequency_penalty,
         seed=request.seed,
     )
-    engine_payload = {"prompt": request.prompt, **sampling}
+    adapter = _adapter_kwargs(request.adapter_identifier, request.adapter_version)
+    engine_payload = {"prompt": request.prompt, **sampling, **adapter}
     completion_id = generate_completion_id("cmpl")
 
     if request.stream:
@@ -272,7 +283,8 @@ async def create_chat_completion(request: ChatCompletionRequest):
         frequency_penalty=request.frequency_penalty,
         seed=request.seed,
     )
-    engine_payload = {"prompt": prompt, **sampling}
+    adapter = _adapter_kwargs(request.adapter_identifier, request.adapter_version)
+    engine_payload = {"prompt": prompt, **sampling, **adapter}
     completion_id = generate_completion_id("chatcmpl")
 
     if request.stream:
