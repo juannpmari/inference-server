@@ -32,7 +32,7 @@ engine:
   sidecar_timeout: 600.0        # seconds
   sidecar_grpc_url: "sidecar:50051"
   model_path: "/models/resident_model"
-  enable_kv_offload: true
+  enable_kv_offload: false
   kv_offload_num_blocks: 1024
   enable_engine_mock: false
   # GPU monitoring

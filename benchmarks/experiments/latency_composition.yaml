@@ -1,0 +1,43 @@
+# Experiment: Latency Composition
+# Stacked barchart of prefill (TTFT) vs decode time for each input/output size combination.
+#
+# Conditions:
+#   siso = Short Input, Short Output
+#   silo = Short Input, Long Output
+#   liso = Long Input, Short Output
+#   lilo = Long Input, Long Output
+
+experiment:
+  name: latency_composition
+  description: "Prefill vs decode latency decomposition across input/output size combinations"
+
+  # Each condition becomes one bar in the final plot
+  conditions:
+    siso:
+      prompt_pool: short
+      max_tokens: 32        # 32 in, 32 out = 64
+    silo:
+      prompt_pool: short
+      max_tokens: 256       # 32 in, 256 out = 288
+    liso:
+      prompt_pool: long
+      concat: 2             # 2 × 128 = 256 input tokens
+      max_tokens: 32        # 256 in, 32 out = 288
+    lilo:
+      prompt_pool: long
+      concat: 2             # 2 × 128 = 256 input tokens
+      max_tokens: 256       # 256 in, 256 out = 512
+
+  dispatch:
+    mode: sequential        # sequential | concurrent | realistic
+    delay: 0              # seconds between sequential requests
+    # concurrency: 4        # only for concurrent mode
+    # rps: 2.0              # only for realistic mode
+    # duration_seconds: 60  # only for realistic mode
+
+  protocol:
+    warmup_requests: 0
+    runs: 1                 # take median of N runs
+    prompts_per_condition: 2
+    cooldown_seconds: 5
+
