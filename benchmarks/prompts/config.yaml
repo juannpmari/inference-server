@@ -1,0 +1,12 @@
+# Path to the source text file (relative to this config or absolute)
+base_text: "base_text.txt"
+
+# Output directory for generated prompt chunks (relative to prompts/)
+output_dir: "data"
+
+# List of chunk sizes (in tokens) to generate
+chunk_sizes:
+  - 32
+
+# Tokenizer encoding name (tiktoken encoding, e.g. "cl100k_base", "o200k_base")
+encoding: "cl100k_base"

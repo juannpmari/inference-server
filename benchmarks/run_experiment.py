@@ -130,43 +130,45 @@ class BenchmarkClient:
 # Prompt loading
 # ---------------------------------------------------------------------------
 
-def load_prompts(pool: str, max_tokens: int, limit: int | None = None, concat: int = 1) -> list[Prompt]:
-    """Load prompts from a pool, optionally concatenating multiple prompts.
+TOKENS_PER_PROMPT = 32
+
+
+def load_prompts(input_length: int, max_tokens: int, limit: int | None = None) -> list[Prompt]:
+    """Load prompts from data/, concatenating to reach the desired input length.
 
     Args:
-        pool: Pool name from manifest (e.g. "short", "long").
+        input_length: Desired input length in tokens (must be divisible by 32).
         max_tokens: max_tokens to set on each Prompt.
         limit: Max number of final prompts to produce.
-        concat: Number of pool prompts to concatenate into each final prompt.
-              e.g. concat=3 with 32-token short prompts produces ~96-token prompts.
     """
-    manifest = json.loads((PROMPTS_DIR / "manifest.json").read_text())
-    entries = manifest[pool]
+    if input_length % TOKENS_PER_PROMPT != 0:
+        raise ValueError(f"input_length ({input_length}) must be divisible by {TOKENS_PER_PROMPT}")
+    concat = input_length // TOKENS_PER_PROMPT
 
-    # Load all raw prompts from the pool
-    raw: list[tuple[str, str, int]] = []  # (name, text, input_tokens)
-    for entry in entries:
-        text = (PROMPTS_DIR / entry["file"]).read_text().strip()
-        name = Path(entry["file"]).stem
-        raw.append((name, text, entry["input_tokens"]))
+    # Load all 32-token prompts from data/
+    data_dir = PROMPTS_DIR / "data"
+    raw: list[tuple[str, str]] = []  # (name, text)
+    for path in sorted(data_dir.glob("*.txt")):
+        raw.append((path.stem, path.read_text().strip()))
 
-    prompts = []
-    # Build concatenated prompts, cycling through the pool if concat > pool size
+    if not raw:
+        raise FileNotFoundError(f"No prompt files found in {data_dir}")
+
+    # Build concatenated prompts, cycling through files if needed
     num_prompts = limit if limit else max(1, len(raw) // concat) if concat <= len(raw) else 1
+    prompts = []
     for p_idx in range(num_prompts):
         parts_text = []
-        parts_tokens = 0
         parts_names = []
         for c in range(concat):
             idx = (p_idx * concat + c) % len(raw)
-            name, text, tok = raw[idx]
+            name, text = raw[idx]
             parts_text.append(text)
-            parts_tokens += tok
             parts_names.append(name)
         prompts.append(Prompt(
             name="_".join(parts_names),
             text=" ".join(parts_text),
-            input_tokens=parts_tokens,
+            input_tokens=input_length,
             max_tokens=max_tokens,
         ))
 
@@ -245,10 +247,9 @@ async def run_condition(
 ) -> dict:
     """Run one condition (e.g. 'siso') through warmup + N measurement runs."""
     prompts = load_prompts(
-        pool=condition_cfg["prompt_pool"],
+        input_length=condition_cfg["input_length"],
         max_tokens=condition_cfg["max_tokens"],
         limit=protocol.get("prompts_per_condition"),
-        concat=condition_cfg.get("concat", 1),
     )
     dispatcher = make_dispatcher(client, prompts, dispatch_cfg)
 
@@ -304,7 +305,7 @@ async def run_condition(
 
     return {
         "condition": condition_name,
-        "prompt_pool": condition_cfg["prompt_pool"],
+        "input_length": condition_cfg["input_length"],
         "max_tokens": condition_cfg["max_tokens"],
         "total_requests": len(median_records),
         "successful_requests": len(ok),
@@ -336,14 +337,47 @@ async def run_condition(
 
 
 # ---------------------------------------------------------------------------
+# .env file helpers
+# ---------------------------------------------------------------------------
+
+def _update_env_file(env_path: Path, overrides: dict[str, str]):
+    """Read .env, update/add keys from overrides, write back."""
+    lines = env_path.read_text().splitlines() if env_path.exists() else []
+    updated_keys: set[str] = set()
+    new_lines: list[str] = []
+    for line in lines:
+        stripped = line.strip()
+        if stripped and not stripped.startswith("#") and "=" in stripped:
+            key = stripped.split("=", 1)[0].strip()
+            if key in overrides:
+                new_lines.append(f"{key}={overrides[key]}")
+                updated_keys.add(key)
+                continue
+        new_lines.append(line)
+    for key, val in overrides.items():
+        if key not in updated_keys:
+            new_lines.append(f"{key}={val}")
+    env_path.write_text("\n".join(new_lines) + "\n")
+
+
+# ---------------------------------------------------------------------------
 # Engine restart
 # ---------------------------------------------------------------------------
 
-async def restart_engine(engine_url: str):
-    logger.info("Restarting engine ...")
+async def restart_engine(engine_url: str, engine_env: dict[str, str] | None = None):
+    project_root = BENCHMARKS_DIR.parent
+    if engine_env:
+        logger.info("Updating .env with: %s", engine_env)
+        _update_env_file(project_root / ".env", engine_env)
+        logger.info("Recreating engine container ...")
+        cmd = ("docker", "compose", "up", "-d", "--force-recreate", "engine")
+    else:
+        logger.info("Restarting engine ...")
+        cmd = ("docker", "compose", "restart", "engine")
     proc = await asyncio.create_subprocess_exec(
-        "docker", "compose", "restart", "engine",
+        *cmd,
         stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.PIPE,
+        cwd=str(project_root),
     )
     await proc.communicate()
     async with httpx.AsyncClient(timeout=httpx.Timeout(15.0)) as c:
@@ -372,12 +406,24 @@ async def run_experiment(experiment_path: str, engine_url: str, output_path: str
         cfg = yaml.safe_load(f)
 
     exp = cfg["experiment"]
-    conditions = exp["conditions"]
     dispatch_cfg = exp["dispatch"]
     protocol = exp.get("protocol", {})
+    use_groups = "condition_groups" in exp
+
+    # Build ordered list of (cond_name, cond_cfg, group_engine_env)
+    if use_groups:
+        ordered_conditions: list[tuple[str, dict, dict | None]] = []
+        for group in exp["condition_groups"]:
+            group_env = group.get("engine_env")
+            for cond_name, cond_cfg in group["conditions"].items():
+                ordered_conditions.append((cond_name, cond_cfg, group_env))
+    else:
+        ordered_conditions = [
+            (name, cfg, None) for name, cfg in exp["conditions"].items()
+        ]
 
     logger.info("Experiment: %s", exp["name"])
-    logger.info("Conditions: %s", list(conditions.keys()))
+    logger.info("Conditions: %s", [c[0] for c in ordered_conditions])
     logger.info("Dispatch: %s", dispatch_cfg["mode"])
 
     client = BenchmarkClient(engine_url)
@@ -388,13 +434,21 @@ async def run_experiment(experiment_path: str, engine_url: str, output_path: str
         "conditions": {},
     }
 
+    env_file_path = BENCHMARKS_DIR.parent / ".env"
+    original_env = env_file_path.read_text() if env_file_path.exists() else None
     try:
-        for cond_name, cond_cfg in conditions.items():
-            if restart:
+        last_env: dict | None = None
+        for cond_name, cond_cfg, group_env in ordered_conditions:
+            if use_groups and group_env is not None and group_env != last_env:
+                await restart_engine(engine_url, engine_env=group_env)
+                last_env = group_env
+            elif restart:
                 await restart_engine(engine_url)
             result = await run_condition(client, engine_url, cond_name, cond_cfg, dispatch_cfg, protocol)
             results["conditions"][cond_name] = result
     finally:
+        if original_env is not None and use_groups:
+            env_file_path.write_text(original_env)
         await client.close()
 
     # Determine output path

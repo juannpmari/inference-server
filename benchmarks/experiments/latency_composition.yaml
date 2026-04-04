@@ -14,30 +14,25 @@ experiment:
   # Each condition becomes one bar in the final plot
   conditions:
     siso:
-      prompt_pool: short
-      max_tokens: 32        # 32 in, 32 out = 64
+      input_length: 32      # 32 in, 32 out
+      max_tokens: 32
     silo:
-      prompt_pool: short
-      max_tokens: 256       # 32 in, 256 out = 288
+      input_length: 32      # 32 in, 256 out
+      max_tokens: 320
     liso:
-      prompt_pool: long
-      concat: 2             # 2 × 128 = 256 input tokens
-      max_tokens: 32        # 256 in, 32 out = 288
+      input_length: 320     # 256 in, 32 out
+      max_tokens: 32
     lilo:
-      prompt_pool: long
-      concat: 2             # 2 × 128 = 256 input tokens
-      max_tokens: 256       # 256 in, 256 out = 512
+      input_length: 320     # 256 in, 256 out
+      max_tokens: 320
 
   dispatch:
     mode: sequential        # sequential | concurrent | realistic
     delay: 0              # seconds between sequential requests
-    # concurrency: 4        # only for concurrent mode
-    # rps: 2.0              # only for realistic mode
-    # duration_seconds: 60  # only for realistic mode
 
   protocol:
-    warmup_requests: 0
+    warmup_requests: 3
     runs: 1                 # take median of N runs
-    prompts_per_condition: 2
+    prompts_per_condition: 30
     cooldown_seconds: 5
 

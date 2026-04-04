@@ -40,10 +40,10 @@ COLORS = {
 }
 
 CONDITION_LABELS = {
-    "siso": "SISO\n(short in, short out)",
-    "silo": "SILO\n(short in, long out)",
-    "liso": "LISO\n(long in, short out)",
-    "lilo": "LILO\n(long in, long out)",
+    "siso": "SISO\n(32, 32)",
+    "silo": "SILO\n(32, 256)",
+    "liso": "LISO\n(256, 32)",
+    "lilo": "LILO\n(256, 256)",
 }
 
 VALID_STATS = ("mean", "p50", "p90", "p99")
