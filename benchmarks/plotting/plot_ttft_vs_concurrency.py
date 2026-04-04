@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """Plot TTFT percentiles vs concurrency level.
 
-Reads the output of run_experiment.py for the ttft_vs_concurrency
+Reads the output of experiment_orchestrator.py for the ttft_vs_concurrency
 experiment and produces a multi-line plot showing how mean, p50, p90,
 and p99 TTFT scale with the number of concurrent requests.
 
@@ -54,17 +54,28 @@ STATS = [
 # Plot
 # ---------------------------------------------------------------------------
 
-def plot_ttft_vs_concurrency(data: dict, out_dir: str, scatter: bool = True) -> str:
+VALID_STATS = ("mean", "p50", "p90", "p99")
+
+
+def plot_ttft_vs_concurrency(
+    data: dict, out_dir: str, scatter: bool = True,
+    stat: str | None = None, skip_x: set[int] | None = None,
+) -> str:
     conditions = data["conditions"]
 
+    # If a single stat is requested, only plot that one
+    active_stats = [(s, l, m) for s, l, m in STATS if s == stat] if stat else STATS
+
     concurrency_levels = []
-    stat_values = {key: [] for key, _, _ in STATS}
+    stat_values = {key: [] for key, _, _ in active_stats}
     scatter_data: dict[int, list[float]] = {}
 
     for cond_name, cond in conditions.items():
         conc = cond["dispatch"]["concurrency"]
+        if skip_x and conc in skip_x:
+            continue
         concurrency_levels.append(conc)
-        for key, _, _ in STATS:
+        for key, _, _ in active_stats:
             stat_values[key].append(cond["stats"]["ttft"][key])
         # Collect per-request TTFT for scatter
         ok = [r for r in cond["per_request"]
@@ -89,21 +100,24 @@ def plot_ttft_vs_concurrency(data: dict, out_dir: str, scatter: bool = True) -> 
                        color=COLORS["scatter"], edgecolors="none", zorder=1)
 
     # Stat lines
-    for key, label, marker_style in STATS:
+    for key, label, marker_style in active_stats:
         ax.plot(concurrency_levels, stat_values[key], marker_style,
                 color=COLORS[key], lw=2, markersize=7, zorder=3,
                 label=f"TTFT {label}")
 
-    # Annotate p99 only
-    for x, y in zip(concurrency_levels, stat_values["p99"]):
+    # Annotate the top stat line
+    annotate_key = active_stats[-1][0]
+    for x, y in zip(concurrency_levels, stat_values[annotate_key]):
         ax.annotate(f"{y:.1f}", (x, y), textcoords="offset points",
                     xytext=(0, 10), ha="center", fontsize=9,
-                    color=COLORS["p99"])
+                    color=COLORS[annotate_key])
 
+    ax.set_xscale("log", base=2)
     ax.set_xlabel("Concurrency Level")
     ax.set_ylabel("TTFT (ms)")
     ax.set_title("TTFT vs Concurrency Level")
     ax.set_xticks(concurrency_levels)
+    ax.set_xticklabels([str(int(c)) for c in concurrency_levels])
     ax.legend()
 
     plt.tight_layout()
@@ -124,6 +138,10 @@ def main():
                         help="Dispatch mode subfolder (default: %(default)s)")
     parser.add_argument("--no-scatter", action="store_true",
                         help="Hide individual request TTFT scatter points")
+    parser.add_argument("--stat", default=None, choices=VALID_STATS,
+                        help="Plot only this statistic (default: all four)")
+    parser.add_argument("--skip-x", default=None,
+                        help="Comma-separated concurrency values to exclude (e.g. 2048,4096)")
     args = parser.parse_args()
 
     results_dir = (Path(__file__).resolve().parent.parent
@@ -135,8 +153,10 @@ def main():
         data = json.load(f)
 
     os.makedirs(output_dir, exist_ok=True)
+    skip_x = set(int(v) for v in args.skip_x.split(",")) if args.skip_x else None
     fpath = plot_ttft_vs_concurrency(data, output_dir,
-                                     scatter=not args.no_scatter)
+                                     scatter=not args.no_scatter,
+                                     stat=args.stat, skip_x=skip_x)
     print(f"Saved: {fpath}")
 
 

@@ -44,54 +44,78 @@ COLORS = {
 # Plot
 # ---------------------------------------------------------------------------
 
-def plot_throughput_vs_concurrency(data: dict, out_dir: str, source: str = "client", skip_x: set[int] | None = None) -> str:
+VALID_STATS = ("mean", "p50", "p90", "p99")
+
+
+def plot_throughput_vs_concurrency(
+    data: dict, out_dir: str, source: str = "client",
+    stat: str = "mean", skip_x: set[int] | None = None,
+) -> str:
     conditions = data["conditions"]
 
     concurrency_levels = []
     throughputs = []
+    latencies = []
 
     for cond_name, cond in conditions.items():
         concurrency = cond["dispatch"]["concurrency"]
+        if skip_x and concurrency in skip_x:
+            continue
         if source == "server":
             tput = (cond.get("server_side_delta", {})
                        .get("throughput", {})
                        .get("output_tokens_per_second", 0.0))
         else:
             tput = cond["client_side_throughput"]["output_tokens_per_second"]
+        latency_ms = cond["stats"]["e2e"][stat] * 1000
         concurrency_levels.append(concurrency)
         throughputs.append(tput)
-
-    # Filter out skipped x values
-    if skip_x:
-        filtered = [(c, t) for c, t in zip(concurrency_levels, throughputs) if c not in skip_x]
-        concurrency_levels, throughputs = zip(*filtered) if filtered else ([], [])
-        concurrency_levels, throughputs = list(concurrency_levels), list(throughputs)
+        latencies.append(latency_ms)
 
     # Sort by concurrency
     order = np.argsort(concurrency_levels)
     concurrency_levels = np.array(concurrency_levels)[order]
     throughputs = np.array(throughputs)[order]
+    latencies = np.array(latencies)[order]
 
     color_key = f"{source}_line"
     color = COLORS.get(color_key, COLORS["client_line"])
 
-    fig, ax = plt.subplots(figsize=(9, 6))
+    fig, ax1 = plt.subplots(figsize=(9, 6))
 
-    ax.plot(concurrency_levels, throughputs, "o-", color=color, lw=2,
-            markersize=7, zorder=3, label=f"Output throughput ({source})")
+    ax1.plot(concurrency_levels, throughputs, "o-", color=color, lw=2,
+             markersize=7, zorder=3, label=f"Output throughput ({source})")
 
-    # Annotate each point
     for x, y in zip(concurrency_levels, throughputs):
-        ax.annotate(f"{y:.1f}", (x, y), textcoords="offset points",
-                    xytext=(0, 10), ha="center", fontsize=9, color=color)
+        ax1.annotate(f"{y:.1f}", (x, y), textcoords="offset points",
+                     xytext=(0, 10), ha="center", fontsize=9, color=color)
 
-    ax.set_xscale("log", base=2)
-    ax.set_xlabel("Concurrency Level")
-    ax.set_ylabel("Output Tokens/s")
-    ax.set_title("Output Token Throughput vs Concurrency Level")
-    ax.set_xticks(concurrency_levels)
-    ax.set_xticklabels([str(int(c)) for c in concurrency_levels])
-    ax.legend()
+    ax1.set_xscale("log", base=2)
+    ax1.set_xlabel("Concurrency Level")
+    ax1.set_ylabel("Output Tokens/s", color=color)
+    ax1.tick_params(axis="y", labelcolor=color)
+    ax1.set_xticks(concurrency_levels)
+    ax1.set_xticklabels([str(int(c)) for c in concurrency_levels])
+
+    # Secondary y-axis: E2E latency
+    lat_color = COLORS.get("server_line" if source == "client" else "client_line", "#C44E52")
+    ax2 = ax1.twinx()
+    ax2.plot(concurrency_levels, latencies, "s--", color=lat_color, lw=1.5,
+             markersize=5, zorder=3, alpha=0.8, label=f"E2E latency {stat} ({source})")
+
+    for x, y in zip(concurrency_levels, latencies):
+        ax2.annotate(f"{y:.0f}", (x, y), textcoords="offset points",
+                     xytext=(0, -12), ha="center", fontsize=8, color=lat_color, alpha=0.8)
+
+    ax2.set_ylabel(f"E2E Latency — {stat} (ms)", color=lat_color)
+    ax2.tick_params(axis="y", labelcolor=lat_color)
+
+    # Combined legend
+    lines1, labels1 = ax1.get_legend_handles_labels()
+    lines2, labels2 = ax2.get_legend_handles_labels()
+    ax1.legend(lines1 + lines2, labels1 + labels2, loc="upper left")
+
+    ax1.set_title(f"Output Token Throughput vs Concurrency Level ({stat})")
 
     plt.tight_layout()
     fpath = os.path.join(out_dir, f"throughput_vs_concurrency_{source}.png")
@@ -107,8 +131,10 @@ def main():
     parser.add_argument("--dispatch-mode", default="concurrent", help="Dispatch mode subfolder (default: %(default)s)")
     parser.add_argument("--source", default="client", choices=("client", "server"),
                         help="Throughput source: client-side or server-side (default: client)")
+    parser.add_argument("--stat", default="mean", choices=VALID_STATS,
+                        help="E2E latency statistic for secondary axis (default: mean)")
     parser.add_argument("--skip-x", default=None,
-                        help="Comma-separated concurrency values to exclude (e.g. 2048,3096)")
+                        help="Comma-separated concurrency values to exclude (e.g. 2048,4096)")
     args = parser.parse_args()
 
     results_dir = Path(__file__).resolve().parent.parent / "results" / args.dispatch_mode / "throughput_vs_concurrency"
@@ -120,7 +146,7 @@ def main():
 
     os.makedirs(output_dir, exist_ok=True)
     skip_x = set(int(v) for v in args.skip_x.split(",")) if args.skip_x else None
-    fpath = plot_throughput_vs_concurrency(data, output_dir, source=args.source, skip_x=skip_x)
+    fpath = plot_throughput_vs_concurrency(data, output_dir, source=args.source, stat=args.stat, skip_x=skip_x)
     print(f"Saved: {fpath}")
 
 

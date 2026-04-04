@@ -1,0 +1,44 @@
+# Experiment: TTFT vs Concurrency Level
+# Multi-line plot of mean/p50/p90/p99 TTFT as a function of concurrent request count.
+# All conditions use the same prompt size; only concurrency varies.
+
+experiment:
+  name: ttft_vs_concurrency
+  description: "TTFT percentile breakdown across concurrency levels (N=4,8,16,32,64)"
+
+  conditions:
+    concurrency_4:
+      input_length: 32
+      max_tokens: 128
+      dispatch:
+        concurrency: 4
+    concurrency_8:
+      input_length: 32
+      max_tokens: 128
+      dispatch:
+        concurrency: 8
+    concurrency_16:
+      input_length: 32
+      max_tokens: 128
+      dispatch:
+        concurrency: 16
+    concurrency_32:
+      input_length: 32
+      max_tokens: 128
+      dispatch:
+        concurrency: 32
+    concurrency_64:
+      input_length: 32
+      max_tokens: 128
+      dispatch:
+        concurrency: 64
+
+  dispatch:
+    mode: concurrent
+    concurrency: 4          # default, overridden per-condition
+
+  protocol:
+    warmup_requests: 5
+    runs: 3
+    prompts_per_condition: 25
+    cooldown_seconds: 10
