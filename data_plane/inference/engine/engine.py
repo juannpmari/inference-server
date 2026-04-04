@@ -53,6 +53,9 @@ class Engine:
                 "--max-lora-rank", str(config.max_lora_rank),
             ])
 
+        if config.enable_prefix_caching:
+            cli_args_list.append("--enable-prefix-caching")
+
         if config.enable_kv_offload:
             cli_args_list.extend([
                 "--kv-transfer-config", json.dumps({

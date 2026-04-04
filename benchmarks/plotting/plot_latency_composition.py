@@ -98,15 +98,19 @@ def plot_latency_composition(data: dict, out_dir: str, stat: str = "mean") -> st
 
 
 def main():
-    default_input = str(Path(__file__).resolve().parent.parent / "results" / "latency_composition.json")
-    default_output = str(Path(__file__).resolve().parent.parent.parent / "resources" / "latency_composition")
-
     parser = argparse.ArgumentParser(description="Plot latency composition stacked barchart")
-    parser.add_argument("--input", default=default_input, help="Path to experiment results JSON")
-    parser.add_argument("--output-dir", default=default_output, help="Directory for output PNGs")
+    parser.add_argument("--input", default=None, help="Path to experiment results JSON")
+    parser.add_argument("--output-dir", default=None, help="Directory for output PNGs")
+    parser.add_argument("--dispatch-mode", default="sequential", help="Dispatch mode subfolder (default: %(default)s)")
     parser.add_argument("--stat", default="mean", choices=VALID_STATS,
                         help="Which aggregation to plot (default: mean)")
     args = parser.parse_args()
+
+    results_dir = Path(__file__).resolve().parent.parent / "results" / args.dispatch_mode / "latency_composition"
+    if args.input is None:
+        args.input = str(results_dir / "latency_composition.json")
+    if args.output_dir is None:
+        args.output_dir = str(results_dir)
 
     with open(args.input) as f:
         data = json.load(f)

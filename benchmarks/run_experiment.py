@@ -451,9 +451,10 @@ async def run_experiment(experiment_path: str, engine_url: str, output_path: str
             env_file_path.write_text(original_env)
         await client.close()
 
-    # Determine output path
+    # Determine output path: results/<dispatch_mode>/<experiment_name>/<experiment_name>.json
     if output_path is None:
-        output_path = str(BENCHMARKS_DIR / "results" / f"{exp['name']}.json")
+        output_dir = BENCHMARKS_DIR / "results" / dispatch_cfg["mode"] / exp["name"]
+        output_path = str(output_dir / f"{exp['name']}.json")
     Path(output_path).parent.mkdir(parents=True, exist_ok=True)
     Path(output_path).write_text(json.dumps(results, indent=2))
     logger.info("Results written to %s", output_path)
