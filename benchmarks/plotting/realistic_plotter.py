@@ -21,6 +21,7 @@ import matplotlib
 matplotlib.use("Agg")
 import matplotlib.pyplot as plt
 import numpy as np
+import seaborn as sns
 
 VALID_STATS = ("mean", "p50", "p90", "p99")
 
@@ -28,16 +29,15 @@ VALID_STATS = ("mean", "p50", "p90", "p99")
 # Style helpers
 # ---------------------------------------------------------------------------
 
-def _apply_style() -> None:
-    for style in ("seaborn-v0_8-whitegrid", "seaborn-whitegrid"):
-        try:
-            plt.style.use(style)
-            return
-        except OSError:
-            continue
-
-
-_apply_style()
+sns.set_theme(style="whitegrid", context="talk", palette="muted", font_scale=0.9)
+plt.rcParams.update({
+    "figure.facecolor": "white",
+    "axes.facecolor": "#f9f9f9",
+    "grid.color": "#e0e0e0",
+    "grid.linewidth": 0.8,
+    "axes.edgecolor": "#cccccc",
+    "axes.linewidth": 0.8,
+})
 
 
 class RealisticPlotter:
@@ -129,9 +129,10 @@ class RealisticPlotter:
 
         fig, ax = plt.subplots(figsize=(9, 6))
 
+        palette = sns.color_palette("muted")
         series_styles = {
-            "cache_disabled": {"color": "#C44E52", "label": "Cache disabled"},
-            "cache_enabled":  {"color": "#4C72B0", "label": "Cache enabled"},
+            "cache_disabled": {"color": palette[3], "label": "Cache disabled"},
+            "cache_enabled":  {"color": palette[0], "label": "Cache enabled"},
         }
 
         all_rps: list[float] = []
@@ -152,13 +153,14 @@ class RealisticPlotter:
                     tput = cond["client_side_throughput"]["output_tokens_per_second"]
                 tput_vals.append(tput)
 
-            ax.plot(rps_vals, tput_vals, "o-", color=style["color"], lw=2,
-                    markersize=7, zorder=3, label=style["label"])
+            ax.plot(rps_vals, tput_vals, "o-", color=style["color"], lw=2.5,
+                    markersize=8, zorder=3, label=style["label"],
+                    markeredgecolor="white", markeredgewidth=1.2)
 
             for x, y in zip(rps_vals, tput_vals):
-                ax.annotate(f"{y:.1f}", (x, y), textcoords="offset points",
-                            xytext=(0, 10), ha="center", fontsize=9,
-                            color=style["color"])
+                ax.annotate(f"{y:,.0f}", (x, y), textcoords="offset points",
+                            xytext=(0, 12), ha="center", fontsize=8,
+                            color=style["color"], fontweight="bold")
 
             all_rps.extend(rps_vals)
             all_tput.extend(tput_vals)
@@ -166,19 +168,18 @@ class RealisticPlotter:
         # Dashed diagonal reference line (ideal linear scaling)
         if all_rps:
             rps_range = np.linspace(min(all_rps), max(all_rps), 50)
-            # Scale so the ideal line starts at the lowest observed throughput
-            # at the lowest RPS
             min_rps = min(all_rps)
             min_tput = min(all_tput) if all_tput else 1.0
             ideal = rps_range * (min_tput / min_rps) if min_rps > 0 else rps_range
-            ax.plot(rps_range, ideal, "--", color="#888888", lw=1, alpha=0.6,
+            ax.plot(rps_range, ideal, "--", color="#aaaaaa", lw=1.5, alpha=0.7,
                     label="Ideal linear scaling", zorder=1)
 
         ax.set_xlabel("Arrival Rate (RPS)")
         ax.set_ylabel("Output Tokens/s")
-        ax.set_title(f"Output Token Throughput vs Arrival Rate ({source})")
-        ax.legend(loc="best")
-        ax.grid(True, alpha=0.3)
+        ax.set_title(f"Output Token Throughput vs Arrival Rate ({source})",
+                      fontweight="bold", pad=15)
+        ax.legend(loc="best", framealpha=0.9, edgecolor="#cccccc")
+        sns.despine(ax=ax, left=True, bottom=True)
 
         plt.tight_layout()
         fpath = os.path.join(out_dir, f"throughput_vs_arrival_rate_{source}.png")
@@ -201,9 +202,10 @@ class RealisticPlotter:
 
         fig, ax = plt.subplots(figsize=(9, 6))
 
+        palette = sns.color_palette("muted")
         series_styles = {
-            "cache_disabled": {"color": "#C44E52", "label": "Cache disabled"},
-            "cache_enabled":  {"color": "#4C72B0", "label": "Cache enabled"},
+            "cache_disabled": {"color": palette[3], "label": "Cache disabled"},
+            "cache_enabled":  {"color": palette[0], "label": "Cache enabled"},
         }
 
         for group_key, pairs in groups.items():
@@ -218,19 +220,21 @@ class RealisticPlotter:
                              .get("max_depth", 0))
                 depth_vals.append(depth)
 
-            ax.plot(rps_vals, depth_vals, "o-", color=style["color"], lw=2,
-                    markersize=7, zorder=3, label=style["label"])
+            ax.plot(rps_vals, depth_vals, "o-", color=style["color"], lw=2.5,
+                    markersize=8, zorder=3, label=style["label"],
+                    markeredgecolor="white", markeredgewidth=1.2)
 
             for x, y in zip(rps_vals, depth_vals):
                 ax.annotate(f"{y}", (x, y), textcoords="offset points",
-                            xytext=(0, 10), ha="center", fontsize=9,
-                            color=style["color"])
+                            xytext=(0, 12), ha="center", fontsize=8,
+                            color=style["color"], fontweight="bold")
 
         ax.set_xlabel("Arrival Rate (RPS)")
         ax.set_ylabel("Max Queue Depth")
-        ax.set_title("Max Queue Depth vs Arrival Rate")
-        ax.legend(loc="best")
-        ax.grid(True, alpha=0.3)
+        ax.set_title("Max Queue Depth vs Arrival Rate",
+                      fontweight="bold", pad=15)
+        ax.legend(loc="best", framealpha=0.9, edgecolor="#cccccc")
+        sns.despine(ax=ax, left=True, bottom=True)
 
         plt.tight_layout()
         fpath = os.path.join(out_dir, "queue_depth_vs_arrival_rate.png")
@@ -243,18 +247,24 @@ class RealisticPlotter:
     # ------------------------------------------------------------------
 
     # 6-line style matrix: group x percentile
-    TTFT_STYLES = {
-        "cache_disabled": {
-            "p50": {"color": "#C44E52", "linestyle": "-",  "label": "No cache p50"},
-            "p90": {"color": "#E07B7B", "linestyle": "--", "label": "No cache p90"},
-            "p99": {"color": "#F0A8A8", "linestyle": ":",  "label": "No cache p99"},
-        },
-        "cache_enabled": {
-            "p50": {"color": "#4C72B0", "linestyle": "-",  "label": "Cache p50"},
-            "p90": {"color": "#7BA3D4", "linestyle": "--", "label": "Cache p90"},
-            "p99": {"color": "#A8C4E0", "linestyle": ":",  "label": "Cache p99"},
-        },
-    }
+    @staticmethod
+    def _ttft_styles():
+        palette = sns.color_palette("muted")
+        red, blue = palette[3], palette[0]
+        red_light = sns.light_palette(red, n_colors=4)
+        blue_light = sns.light_palette(blue, n_colors=4)
+        return {
+            "cache_disabled": {
+                "p50": {"color": red,           "linestyle": "-",  "label": "No cache p50"},
+                "p90": {"color": red_light[2],  "linestyle": "--", "label": "No cache p90"},
+                "p99": {"color": red_light[1],  "linestyle": ":",  "label": "No cache p99"},
+            },
+            "cache_enabled": {
+                "p50": {"color": blue,           "linestyle": "-",  "label": "Cache p50"},
+                "p90": {"color": blue_light[2],  "linestyle": "--", "label": "Cache p90"},
+                "p99": {"color": blue_light[1],  "linestyle": ":",  "label": "Cache p99"},
+            },
+        }
 
     def plot_ttft_vs_arrival_rate(
         self,
@@ -270,13 +280,15 @@ class RealisticPlotter:
 
         fig, ax = plt.subplots(figsize=(9, 6))
 
+        ttft_styles = self._ttft_styles()
+
         for group_key, pairs in groups.items():
             if not pairs:
                 continue
             rps_vals = [rps for rps, _ in pairs]
 
             for pct in percentiles:
-                style = self.TTFT_STYLES[group_key][pct]
+                style = ttft_styles[group_key][pct]
                 ttft_vals = []
                 saturated_mask = []
 
@@ -285,8 +297,9 @@ class RealisticPlotter:
                     saturated_mask.append(cond.get("saturation_detected", False))
 
                 ax.plot(rps_vals, ttft_vals, marker="o", color=style["color"],
-                        linestyle=style["linestyle"], lw=2, markersize=6,
-                        zorder=3, label=style["label"])
+                        linestyle=style["linestyle"], lw=2.5, markersize=7,
+                        zorder=3, label=style["label"],
+                        markeredgecolor="white", markeredgewidth=1.0)
 
                 # Mark saturated points with a star
                 for i, (x, y, sat) in enumerate(
@@ -298,9 +311,9 @@ class RealisticPlotter:
 
         ax.set_xlabel("Arrival Rate (RPS)")
         ax.set_ylabel("TTFT (ms)")
-        ax.set_title("TTFT vs Arrival Rate")
-        ax.legend(loc="best", fontsize=8)
-        ax.grid(True, alpha=0.3)
+        ax.set_title("TTFT vs Arrival Rate", fontweight="bold", pad=15)
+        ax.legend(loc="best", fontsize=8, framealpha=0.9, edgecolor="#cccccc")
+        sns.despine(ax=ax, left=True, bottom=True)
 
         plt.tight_layout()
         fpath = os.path.join(out_dir, "ttft_vs_arrival_rate.png")
