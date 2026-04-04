@@ -26,6 +26,9 @@ Current shutdown cancels in-flight tasks immediately. Add drain logic:
 
 Small effort, completes what's already partially there in the engine lifespan.
 
+### Understans the whole code
+Read everything, understand the design choices for each module.
+
 ---
 
 ## Phase 1 — Finish Benchmarking
