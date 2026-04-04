@@ -140,6 +140,7 @@ This project is licensed under the MIT License - see the [LICENSE](LICENSE) file
 - [Architecture Decision Records](docs/adr/)
 - [API Documentation](docs/api.md)
 - [Performance Benchmarks](docs/benchmarks.md)
+- [Benchmark Results Report](docs/benchmark_report.md) — Detailed performance analysis with plots and theoretical background
 
 Dockerfile.engine
 

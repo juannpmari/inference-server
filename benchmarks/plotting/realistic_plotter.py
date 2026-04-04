@@ -74,6 +74,7 @@ class RealisticPlotter:
     @staticmethod
     def _extract_grouped_series(
         data: dict,
+        cache_filter: str | None = None,
     ) -> dict[str, list[tuple[float, dict]]]:
         """Split conditions into cache_disabled / cache_enabled groups.
 
@@ -81,6 +82,11 @@ class RealisticPlotter:
         ``(rps, cond_data)`` tuples sorted by RPS.  Conditions whose name
         starts with ``nocache_`` are placed in ``cache_disabled``; those
         starting with ``cache_`` go into ``cache_enabled``.
+
+        Args:
+            cache_filter: If ``"cache"``, only return cache_enabled series.
+                          If ``"no_cache"``, only return cache_disabled series.
+                          If *None*, return both.
         """
         groups: dict[str, list[tuple[float, dict]]] = {
             "cache_disabled": [],
@@ -100,6 +106,11 @@ class RealisticPlotter:
         for key in groups:
             groups[key].sort(key=lambda pair: pair[0])
 
+        if cache_filter == "cache":
+            groups["cache_disabled"] = []
+        elif cache_filter == "no_cache":
+            groups["cache_enabled"] = []
+
         return groups
 
     # ------------------------------------------------------------------
@@ -112,8 +123,9 @@ class RealisticPlotter:
         out_dir: str,
         *,
         source: str = "client",
+        cache_filter: str | None = None,
     ) -> str:
-        groups = self._extract_grouped_series(data)
+        groups = self._extract_grouped_series(data, cache_filter=cache_filter)
 
         fig, ax = plt.subplots(figsize=(9, 6))
 
@@ -182,8 +194,10 @@ class RealisticPlotter:
         self,
         data: dict,
         out_dir: str,
+        *,
+        cache_filter: str | None = None,
     ) -> str:
-        groups = self._extract_grouped_series(data)
+        groups = self._extract_grouped_series(data, cache_filter=cache_filter)
 
         fig, ax = plt.subplots(figsize=(9, 6))
 
@@ -248,8 +262,9 @@ class RealisticPlotter:
         out_dir: str,
         *,
         stat: str | None = None,
+        cache_filter: str | None = None,
     ) -> str:
-        groups = self._extract_grouped_series(data)
+        groups = self._extract_grouped_series(data, cache_filter=cache_filter)
 
         percentiles = [stat] if stat else ["p50", "p90", "p99"]
 
@@ -337,6 +352,9 @@ class RealisticPlotter:
             if "source" in plot_cfg:
                 kwargs["source"] = plot_cfg["source"]
 
+            if "cache_filter" in plot_cfg:
+                kwargs["cache_filter"] = plot_cfg["cache_filter"]
+
             method = getattr(plotter, method_name)
             fpath = method(data, out_dir, **kwargs)
             saved.append(fpath)
@@ -356,6 +374,9 @@ class RealisticPlotter:
                             help="Directory for output PNGs")
         shared.add_argument("--dispatch-mode", default="realistic",
                             help="Dispatch mode subfolder (default: %(default)s)")
+        shared.add_argument("--cache-filter", default=None,
+                            choices=("cache", "no_cache"),
+                            help="Plot only cache-enabled or cache-disabled series")
 
         parser = argparse.ArgumentParser(
             description="Realistic (arrival-rate sweep) experiment plotter",
@@ -406,6 +427,8 @@ class RealisticPlotter:
             kwargs["source"] = args.source
         elif args.plot == "ttft":
             kwargs["stat"] = getattr(args, "stat", None)
+        if args.cache_filter:
+            kwargs["cache_filter"] = args.cache_filter
 
         fpath = method(data, output_dir, **kwargs)
         print(f"Saved: {fpath}")
