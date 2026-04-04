@@ -20,7 +20,7 @@ engine:
   max_model_len: 16000
   gpu_memory_utilization: 0.70
   dtype: "bfloat16"
-  max_pending: 10
+  max_pending: 50000
   temperature: 0.0
   enable_lora: true
   max_loras: 4
@@ -34,6 +34,7 @@ engine:
   model_path: "/models/resident_model"
   enable_kv_offload: false
   kv_offload_num_blocks: 1024
+  enable_prefix_caching: true
   enable_engine_mock: false
   # GPU monitoring
   gpu_monitor_enabled: true

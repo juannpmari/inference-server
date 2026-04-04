@@ -1,22 +1,24 @@
 #!/usr/bin/env python3
-"""Generic experiment runner.
+"""Generic experiment orchestrator.
 
 Reads an experiment YAML, runs each condition using the specified
 dispatcher, and writes structured results to JSON.
 
 Usage:
-    python -m benchmarks.run_experiment experiments/latency_composition.yaml
-    python -m benchmarks.run_experiment experiments/latency_composition.yaml --engine-url http://localhost:8080
-    python -m benchmarks.run_experiment experiments/latency_composition.yaml --output results/latency.json
+    python -m benchmarks.experiment_orchestrator experiments/latency_composition.yaml
+    python -m benchmarks.experiment_orchestrator experiments/latency_composition.yaml --engine-url http://localhost:8080
+    python -m benchmarks.experiment_orchestrator experiments/latency_composition.yaml --output results/latency.json
 """
 
 from __future__ import annotations
 
 import argparse
 import asyncio
+import datetime
 import json
 import logging
 import statistics
+import subprocess
 import time
 from pathlib import Path
 
@@ -199,6 +201,74 @@ def make_dispatcher(client: BenchmarkClient, prompts: list[Prompt], dispatch_cfg
         )
     else:
         raise ValueError(f"Unknown dispatch mode: {mode}")
+
+
+# ---------------------------------------------------------------------------
+# Helpers
+# ---------------------------------------------------------------------------
+
+def _get_git_commit() -> str:
+    try:
+        return subprocess.check_output(
+            ["git", "rev-parse", "HEAD"],
+            cwd=str(BENCHMARKS_DIR),
+            text=True,
+            stderr=subprocess.DEVNULL,
+        ).strip()
+    except Exception:
+        return "unknown"
+
+
+def _build_ordered_conditions(exp: dict) -> list[tuple[str, dict, dict | None]]:
+    """Extract ordered (name, cfg, group_env) tuples from experiment config."""
+    if "condition_groups" in exp:
+        ordered: list[tuple[str, dict, dict | None]] = []
+        for group in exp["condition_groups"]:
+            group_env = group.get("engine_env")
+            for cond_name, cond_cfg in group["conditions"].items():
+                ordered.append((cond_name, cond_cfg, group_env))
+        return ordered
+    return [(name, cfg, None) for name, cfg in exp["conditions"].items()]
+
+
+VALID_DISPATCH_MODES = {"sequential", "concurrent", "realistic"}
+
+
+def validate_yaml(cfg: dict) -> None:
+    """Validate experiment YAML config upfront. Raises ValueError on problems."""
+    if "experiment" not in cfg:
+        raise ValueError("Missing top-level 'experiment' key")
+
+    exp = cfg["experiment"]
+
+    if "name" not in exp:
+        raise ValueError("Missing 'experiment.name'")
+
+    if "dispatch" not in exp:
+        raise ValueError("Missing 'experiment.dispatch'")
+
+    mode = exp["dispatch"].get("mode")
+    if mode not in VALID_DISPATCH_MODES:
+        raise ValueError(f"Invalid dispatch mode '{mode}', must be one of {VALID_DISPATCH_MODES}")
+
+    has_conditions = "conditions" in exp
+    has_groups = "condition_groups" in exp
+    if not has_conditions and not has_groups:
+        raise ValueError("Must specify either 'conditions' or 'condition_groups'")
+    if has_conditions and has_groups:
+        raise ValueError("Cannot specify both 'conditions' and 'condition_groups'")
+
+    ordered = _build_ordered_conditions(exp)
+    for cond_name, cond_cfg, _ in ordered:
+        if "input_length" not in cond_cfg:
+            raise ValueError(f"Condition '{cond_name}': missing 'input_length'")
+        if "max_tokens" not in cond_cfg:
+            raise ValueError(f"Condition '{cond_name}': missing 'max_tokens'")
+        il = cond_cfg["input_length"]
+        if il % TOKENS_PER_PROMPT != 0:
+            raise ValueError(
+                f"Condition '{cond_name}': input_length ({il}) must be divisible by {TOKENS_PER_PROMPT}"
+            )
 
 
 # ---------------------------------------------------------------------------
@@ -413,42 +483,143 @@ async def restart_engine(engine_url: str, engine_env: dict[str, str] | None = No
 
 
 # ---------------------------------------------------------------------------
+# Dry-run
+# ---------------------------------------------------------------------------
+
+def dry_run(experiment_path: str, restart: bool):
+    """Validate YAML and print experiment plan without executing."""
+    with open(experiment_path) as f:
+        cfg = yaml.safe_load(f)
+    validate_yaml(cfg)
+
+    exp = cfg["experiment"]
+    dispatch_cfg = exp["dispatch"]
+    protocol = exp.get("protocol", {})
+    ordered = _build_ordered_conditions(exp)
+    use_groups = "condition_groups" in exp
+
+    print(f"Experiment : {exp['name']}")
+    print(f"Description: {exp.get('description', '')}")
+    print(f"Dispatch   : {dispatch_cfg['mode']}")
+    print(f"Conditions : {len(ordered)}")
+    print()
+
+    runs = protocol.get("runs", 3)
+    warmup = protocol.get("warmup_requests", 3)
+    prompts = protocol.get("prompts_per_condition", "all")
+    timeout = protocol.get("timeout_per_condition", 600)
+    print(f"Protocol: runs={runs}, warmup={warmup}, prompts_per_condition={prompts}, timeout={timeout}s")
+    print()
+
+    print("Conditions:")
+    last_env: dict | None = None
+    for cond_name, cond_cfg, group_env in ordered:
+        overrides = cond_cfg.get("dispatch", {})
+        override_str = f"  dispatch overrides: {overrides}" if overrides else ""
+        print(f"  - {cond_name}: input_length={cond_cfg['input_length']}, "
+              f"max_tokens={cond_cfg['max_tokens']}{override_str}")
+        if use_groups and group_env is not None and group_env != last_env:
+            print(f"    ^ engine restart with env: {group_env}")
+            last_env = group_env
+        elif restart:
+            print(f"    ^ engine restart")
+    print()
+    print("Dry run complete — no requests were sent.")
+
+
+# ---------------------------------------------------------------------------
 # Main
 # ---------------------------------------------------------------------------
 
-async def run_experiment(experiment_path: str, engine_url: str, output_path: str | None, restart: bool):
+async def run_experiment(
+    experiment_path: str,
+    engine_url: str,
+    output_path: str | None,
+    restart: bool,
+    resume: bool = False,
+    only: str | None = None,
+    skip: str | None = None,
+) -> dict:
+    start_time = datetime.datetime.now(datetime.timezone.utc)
+
     with open(experiment_path) as f:
         cfg = yaml.safe_load(f)
+
+    validate_yaml(cfg)
 
     exp = cfg["experiment"]
     dispatch_cfg = exp["dispatch"]
     protocol = exp.get("protocol", {})
     use_groups = "condition_groups" in exp
+    timeout = protocol.get("timeout_per_condition", 600)
 
-    # Build ordered list of (cond_name, cond_cfg, group_engine_env)
-    if use_groups:
-        ordered_conditions: list[tuple[str, dict, dict | None]] = []
-        for group in exp["condition_groups"]:
-            group_env = group.get("engine_env")
-            for cond_name, cond_cfg in group["conditions"].items():
-                ordered_conditions.append((cond_name, cond_cfg, group_env))
-    else:
-        ordered_conditions = [
-            (name, cfg, None) for name, cfg in exp["conditions"].items()
-        ]
+    ordered_conditions = _build_ordered_conditions(exp)
+    all_names = {name for name, _, _ in ordered_conditions}
+
+    # --- Condition filtering (--only / --skip) ---
+    if only:
+        only_set = set(only.split(","))
+        unknown = only_set - all_names
+        if unknown:
+            raise ValueError(f"--only references unknown conditions: {unknown}")
+        ordered_conditions = [(n, c, e) for n, c, e in ordered_conditions if n in only_set]
+    if skip:
+        skip_set = set(skip.split(","))
+        unknown = skip_set - all_names
+        if unknown:
+            raise ValueError(f"--skip references unknown conditions: {unknown}")
+        ordered_conditions = [(n, c, e) for n, c, e in ordered_conditions if n not in skip_set]
 
     logger.info("Experiment: %s", exp["name"])
     logger.info("Conditions: %s", [c[0] for c in ordered_conditions])
     logger.info("Dispatch: %s", dispatch_cfg["mode"])
 
     client = BenchmarkClient(engine_url)
-    results = {
+    results: dict = {
         "experiment": exp["name"],
         "description": exp.get("description", ""),
         "dispatch_mode": dispatch_cfg["mode"],
         "dispatch_config": dispatch_cfg,
+        "metadata": {
+            "timestamp": start_time.isoformat(),
+            "git_commit": _get_git_commit(),
+            "experiment_yaml": cfg,
+            "engine_url": engine_url,
+        },
         "conditions": {},
     }
+
+    # Resolve output path early so intermediate saves work.
+    if output_path is None:
+        output_dir = BENCHMARKS_DIR / "results" / dispatch_cfg["mode"] / exp["name"]
+        out = str(output_dir / f"{exp['name']}.json")
+    else:
+        out = output_path
+
+    # --- Incremental results: load existing output if present ---
+    if Path(out).exists():
+        try:
+            existing = json.loads(Path(out).read_text())
+            results["conditions"] = existing.get("conditions", {})
+            logger.info("Loaded %d existing conditions from %s",
+                        len(results["conditions"]), out)
+        except (json.JSONDecodeError, KeyError):
+            logger.warning("Could not load existing results from %s, starting fresh", out)
+
+    # --- Resumability: skip already-completed conditions ---
+    if resume:
+        completed = set(results["conditions"].keys())
+        before_count = len(ordered_conditions)
+        ordered_conditions = [
+            (n, c, e) for n, c, e in ordered_conditions if n not in completed
+        ]
+        skipped = before_count - len(ordered_conditions)
+        if skipped:
+            logger.info("Resuming: skipped %d already-completed conditions", skipped)
+        if not ordered_conditions:
+            logger.info("All conditions already completed — nothing to run")
+            results["metadata"]["total_duration_seconds"] = 0.0
+            return results
 
     env_file_path = BENCHMARKS_DIR.parent / ".env"
     original_env = env_file_path.read_text() if env_file_path.exists() else None
@@ -460,20 +631,40 @@ async def run_experiment(experiment_path: str, engine_url: str, output_path: str
                 last_env = group_env
             elif restart:
                 await restart_engine(engine_url)
-            result = await run_condition(client, engine_url, cond_name, cond_cfg, dispatch_cfg, protocol)
-            results["conditions"][cond_name] = result
+
+            # --- Per-condition timeout ---
+            try:
+                result = await asyncio.wait_for(
+                    run_condition(client, engine_url, cond_name, cond_cfg, dispatch_cfg, protocol),
+                    timeout=timeout,
+                )
+                results["conditions"][cond_name] = result
+            except asyncio.TimeoutError:
+                logger.warning("Condition '%s' timed out after %ds — skipping", cond_name, timeout)
+                results["conditions"][cond_name] = {
+                    "condition": cond_name,
+                    "error": f"Timed out after {timeout} seconds",
+                    "input_length": cond_cfg["input_length"],
+                    "max_tokens": cond_cfg["max_tokens"],
+                }
+
+            # Write intermediate results after each condition so completed
+            # work is preserved if a later condition fails.
+            Path(out).parent.mkdir(parents=True, exist_ok=True)
+            Path(out).write_text(json.dumps(results, indent=2))
+            logger.info("Intermediate results saved to %s", out)
     finally:
+        elapsed = (datetime.datetime.now(datetime.timezone.utc) - start_time).total_seconds()
+        results["metadata"]["total_duration_seconds"] = round(elapsed, 2)
+        # Final write with duration included
+        Path(out).parent.mkdir(parents=True, exist_ok=True)
+        Path(out).write_text(json.dumps(results, indent=2))
+
         if original_env is not None and use_groups:
             env_file_path.write_text(original_env)
         await client.close()
 
-    # Determine output path: results/<dispatch_mode>/<experiment_name>/<experiment_name>.json
-    if output_path is None:
-        output_dir = BENCHMARKS_DIR / "results" / dispatch_cfg["mode"] / exp["name"]
-        output_path = str(output_dir / f"{exp['name']}.json")
-    Path(output_path).parent.mkdir(parents=True, exist_ok=True)
-    Path(output_path).write_text(json.dumps(results, indent=2))
-    logger.info("Results written to %s", output_path)
+    logger.info("Final results written to %s", out)
 
     return results
 
@@ -484,9 +675,19 @@ def main():
     parser.add_argument("--engine-url", default="http://localhost:8080", help="Engine URL (default: %(default)s)")
     parser.add_argument("--output", default=None, help="Output JSON path (default: benchmarks/results/<experiment_name>.json)")
     parser.add_argument("--restart", action="store_true", help="Restart engine between conditions")
+    parser.add_argument("--resume", action="store_true", help="Skip conditions already present in the output file")
+    parser.add_argument("--only", default=None, help="Comma-separated condition names to run (others skipped)")
+    parser.add_argument("--skip", default=None, help="Comma-separated condition names to skip")
+    parser.add_argument("--dry-run", action="store_true", help="Validate YAML and print plan without executing")
     args = parser.parse_args()
 
-    asyncio.run(run_experiment(args.experiment, args.engine_url, args.output, args.restart))
+    if args.dry_run:
+        dry_run(args.experiment, args.restart)
+    else:
+        asyncio.run(run_experiment(
+            args.experiment, args.engine_url, args.output, args.restart,
+            resume=args.resume, only=args.only, skip=args.skip,
+        ))
 
 
 if __name__ == "__main__":
