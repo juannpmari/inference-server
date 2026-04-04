@@ -27,12 +27,17 @@ Ask which dispatch mode fits the experiment:
 
 ## Step 4: Set protocol parameters
 
-Propose defaults and let the user adjust:
+**Think carefully about which protocol parameters actually matter for this experiment.** Not every parameter applies to every experiment — including an irrelevant parameter adds noise to the YAML and misleads future readers into thinking it was a deliberate choice.
 
-- `warmup_requests`: 3
-- `runs`: 3 (number of full repetitions; median run is selected)
-- `prompts_per_condition`: 10
-- `cooldown_seconds`: 5
+For each parameter below, decide whether it is relevant given the experiment's dispatch mode, independent variable, and what is being measured. **Only include parameters that meaningfully affect the experiment. Omit any that don't apply — the runner has sensible defaults.**
+
+Guidelines:
+- `prompts_per_condition`: Controls how many unique prompts are loaded. In concurrent mode, the dispatcher builds batches of size `concurrency` via round-robin over the prompt pool — so `prompts_per_condition` does NOT control how many requests are sent. Only include it if prompt diversity matters (e.g. avoiding prefix cache hits). If the experiment doesn't care about prompt content, omit it and let the runner load all available prompts by default.
+- `runs`: Number of full repetitions (median is selected). Useful for reducing noise in latency measurements. Less important when the metric is aggregate throughput over many concurrent requests.
+- `warmup_requests`: Almost always applicable — include unless there's a reason not to.
+- `cooldown_seconds`: Relevant when running multiple conditions sequentially to avoid interference. Omit for single-condition experiments.
+
+Propose only the applicable parameters with justification, and confirm with the user.
 
 ## Step 5: Create the experiment YAML
 
@@ -88,7 +93,7 @@ Read `benchmarks/experiments.md` and update it with all of the following:
 1. **Add a detailed section** for the new experiment, following the same format as the existing experiment sections. The section must include:
    - **Goal**: what the experiment measures.
    - **Conditions table**: listing every condition with its `input_length` and `max_tokens` values.
-   - **Run command**: the exact `python3 -m benchmarks.run_experiment` invocation.
+   - **Run command**: the exact `python3 -m benchmarks.experiment_orchestrator` invocation.
    - **Plot command**: the exact `python3 -m benchmarks.plotting.plot_<name>` invocation.
    - **Output**: what the plot shows.
 
@@ -99,6 +104,6 @@ Read `benchmarks/experiments.md` and update it with all of the following:
 ## Step 8: Summary
 
 Print a summary showing:
-- The YAML path and how to run: `python3 -m benchmarks.run_experiment benchmarks/experiments/<name>.yaml`
+- The YAML path and how to run: `python3 -m benchmarks.experiment_orchestrator benchmarks/experiments/<name>.yaml`
 - The plotting script path and how to plot: `python3 -m benchmarks.plotting.plot_<name> --input benchmarks/results/<name>.json --stat mean`
 - Any caveats (input_length constraints, prompt pool sizes, etc.)

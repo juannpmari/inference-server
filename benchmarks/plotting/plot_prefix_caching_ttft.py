@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """Plot prefix caching impact on TTFT.
 
-Reads the output of run_experiment.py for the prefix_caching_ttft experiment
+Reads the output of experiment_orchestrator.py for the prefix_caching_ttft experiment
 and produces a dual-line plot comparing TTFT with and without prefix caching
 across input lengths.
 

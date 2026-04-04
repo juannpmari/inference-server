@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """Plot TTFT vs input token length.
 
-Reads the output of run_experiment.py for the ttft_vs_input_length experiment
+Reads the output of experiment_orchestrator.py for the ttft_vs_input_length experiment
 and produces a line plot with error bands showing how TTFT scales with input size.
 
 Usage:

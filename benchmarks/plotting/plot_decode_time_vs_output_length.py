@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """Plot decode time vs output token length.
 
-Reads the output of run_experiment.py for the decode_time_vs_output_length
+Reads the output of experiment_orchestrator.py for the decode_time_vs_output_length
 experiment and produces a line plot showing how decode time scales with output size.
 
 Usage:

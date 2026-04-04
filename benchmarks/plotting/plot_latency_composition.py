@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """Plot latency composition (prefill vs decode) as a stacked barchart.
 
-Reads the output of run_experiment.py for the latency_composition experiment
+Reads the output of experiment_orchestrator.py for the latency_composition experiment
 and produces a stacked bar chart with one bar per condition (SISO, SILO, LISO, LILO).
 
 Usage:
