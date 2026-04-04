@@ -53,6 +53,9 @@ class Engine:
                 "--max-lora-rank", str(config.max_lora_rank),
             ])
 
+        if config.enable_prefix_caching:
+            cli_args_list.append("--enable-prefix-caching")
+
         if config.enable_kv_offload:
             cli_args_list.extend([
                 "--kv-transfer-config", json.dumps({
@@ -312,6 +315,33 @@ class Engine:
                             await queue.put(None)  # sentinel
                             del self.request_queues[request_id]
                             self.request_prev_text.pop(request_id, None)
+
+                            # Finalize timing and record for streaming requests
+                            if timing:
+                                timing.finished_at = time.time()
+                                timing.output_tokens = timing.step_count
+                                if hasattr(output, 'prompt_token_ids') and output.prompt_token_ids:
+                                    timing.input_tokens = len(output.prompt_token_ids)
+                                record = RequestRecord.from_timing(request_id, self.config.model_name, timing)
+                                if self.collector:
+                                    self.collector.record_request(record)
+                                model = self.config.model_name
+                                if record.ttft_s > 0:
+                                    metrics.engine_time_to_first_token_seconds.labels(model=model).observe(record.ttft_s)
+                                if record.queue_wait_s > 0:
+                                    metrics.engine_queue_wait_seconds.labels(model=model).observe(record.queue_wait_s)
+                                if record.prefill_s > 0:
+                                    metrics.engine_prefill_seconds.labels(model=model).observe(record.prefill_s)
+                                if record.inter_token_latency_s > 0:
+                                    metrics.engine_inter_token_latency_seconds.labels(model=model).observe(record.inter_token_latency_s)
+                                if record.input_tokens > 0:
+                                    metrics.engine_input_tokens_per_request.labels(model=model).observe(record.input_tokens)
+                                if record.output_tokens > 0:
+                                    metrics.engine_output_tokens_per_request.labels(model=model).observe(record.output_tokens)
+                                if record.tokens_per_second > 0:
+                                    metrics.engine_decode_tokens_per_second.labels(model=model).observe(record.tokens_per_second)
+                                    metrics.engine_tokens_per_second.labels(model=model).set(record.tokens_per_second)
+                                del self.request_timings[request_id]
 
                     if future and not future.done():
                         if output.finished:

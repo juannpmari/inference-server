@@ -63,9 +63,12 @@ class MultiTieredCacheManager:
         """Load block bytes from L1. Returns None on miss."""
         data = self.l1.load(block_id)
         if data is not None:
+            self.registry._hits += 1
             block_hash = self.l1._id_to_hash.get(block_id)
             if block_hash:
                 self.registry.record_access(block_hash)
+        else:
+            self.registry._misses += 1
         return data
 
     def free_block(self, block_id: int) -> bool:

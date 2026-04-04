@@ -1,0 +1,49 @@
+# Experiment: Latency Composition
+# Stacked barchart of prefill (TTFT) vs decode time for each input/output size combination.
+#
+# Conditions:
+#   siso = Short Input, Short Output
+#   silo = Short Input, Long Output
+#   liso = Long Input, Short Output
+#   lilo = Long Input, Long Output
+
+experiment:
+  name: latency_composition
+  description: "Prefill vs decode latency decomposition across input/output size combinations"
+
+  # Each condition becomes one bar in the final plot
+  conditions:
+    siso:
+      input_length: 32      # 32 in, 32 out
+      max_tokens: 32
+    silo:
+      input_length: 32      # 32 in, 256 out
+      max_tokens: 320
+    liso:
+      input_length: 320     # 256 in, 32 out
+      max_tokens: 32
+    lilo:
+      input_length: 320     # 256 in, 256 out
+      max_tokens: 320
+
+  dispatch:
+    mode: sequential        # sequential | concurrent | realistic
+    delay: 0              # seconds between sequential requests
+
+  protocol:
+    warmup_requests: 3
+    runs: 1                 # take median of N runs
+    prompts_per_condition: 30
+    cooldown_seconds: 5
+
+  plots:
+    latency_composition:
+      description: "Stacked bar chart decomposing e2e latency into prefill (TTFT) and decode time"
+      x: condition
+      y:
+        - label: "Prefill (TTFT)"
+          field: stats.ttft.mean
+        - label: "Decode"
+          field: stats.decode_time.mean
+      style: stacked_bar
+

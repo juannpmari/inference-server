@@ -60,6 +60,12 @@ COPY server_config.yaml ./
 COPY shared/ ./shared/
 COPY data_plane/ ./data_plane/
 
+# Compile protobuf definitions (must run after copying shared/proto/)
+RUN .venv/bin/python -m grpc_tools.protoc -I shared/proto \
+    --python_out=shared/proto --pyi_out=shared/proto \
+    --grpc_python_out=shared/proto shared/proto/kv_cache.proto && \
+    sed -i 's/^import kv_cache_pb2/from shared.proto import kv_cache_pb2/' shared/proto/kv_cache_pb2_grpc.py
+
 # Create model storage directory (shared volume with sidecar)
 RUN mkdir -p /mnt/models
 

@@ -1,0 +1,90 @@
+# Experiment: Concurrency Sweep
+# Unified experiment that sweeps concurrency levels with static prompts.
+# Produces throughput-vs-concurrency, TTFT-vs-concurrency, and throughput-latency
+# Pareto plots from a single run.
+
+experiment:
+  name: concurrency_sweep
+  description: "Concurrency sweep (input=32, output=128) across N=4,8,16,32,64"
+
+  conditions:
+    concurrency_4:
+      input_length: 32
+      max_tokens: 128
+      dispatch:
+        concurrency: 4
+    concurrency_8:
+      input_length: 32
+      max_tokens: 128
+      dispatch:
+        concurrency: 8
+    concurrency_16:
+      input_length: 32
+      max_tokens: 128
+      dispatch:
+        concurrency: 16
+    concurrency_32:
+      input_length: 32
+      max_tokens: 128
+      dispatch:
+        concurrency: 32
+    concurrency_64:
+      input_length: 32
+      max_tokens: 128
+      dispatch:
+        concurrency: 64
+    concurrency_128:
+      input_length: 32
+      max_tokens: 128
+      dispatch:
+        concurrency: 128
+    concurrency_256:
+      input_length: 32
+      max_tokens: 128
+      dispatch:
+        concurrency: 256
+    concurrency_512:
+      input_length: 32
+      max_tokens: 128
+      dispatch:
+        concurrency: 512
+    concurrency_1024:
+      input_length: 32
+      max_tokens: 128
+      dispatch:
+        concurrency: 1024
+
+  dispatch:
+    mode: concurrent
+    concurrency: 4          # default, overridden per-condition
+
+  protocol:
+    warmup_requests: 5
+    runs: 3
+    prompts_per_condition: 25
+    cooldown_seconds: 10
+
+  plots:
+    throughput_vs_concurrency:
+      description: "Output token throughput scaling across concurrency levels"
+      x: dispatch.concurrency
+      y: client_side_throughput.output_tokens_per_second
+      series:
+        - label: "Throughput"
+    ttft_vs_concurrency:
+      description: "TTFT percentile breakdown across concurrency levels"
+      x: dispatch.concurrency
+      y:
+        - label: "Mean"
+          field: stats.ttft.mean
+        - label: "P50"
+          field: stats.ttft.p50
+        - label: "P90"
+          field: stats.ttft.p90
+        - label: "P99"
+          field: stats.ttft.p99
+    throughput_vs_latency:
+      description: "Throughput-latency Pareto frontier across concurrency levels"
+      x: client_side_throughput.output_tokens_per_second
+      y: stats.e2e.mean
+      style: scatter_pareto

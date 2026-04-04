@@ -1,0 +1,140 @@
+# benchmarks/benchmark_config.yaml
+#
+# Benchmark sweep configuration.
+# See docs/benchmarking/plan.md for the full protocol.
+
+server:
+  engine_url: "http://localhost:8080"
+  gateway_url: "http://localhost:8000"
+  # Use gateway_url for end-to-end, engine_url for direct engine benchmarks
+  target: "engine"  # "engine" | "gateway"
+
+defaults:
+  warmup_requests: 3        # discarded from metrics
+  cooldown_seconds: 30       # thermal cooldown between configurations
+  max_gpu_temp_c: 80         # discard run if GPU temp exceeds this at measurement start
+  requests_per_scenario: 50
+  runs_per_config: 3         # repetitions; report median values
+
+# Define axes to sweep
+axes:
+  models:
+    - name: "qwen-0.5b"
+      ENGINE_MODEL_NAME: "Qwen/Qwen2.5-0.5B-Instruct"
+      requires_restart: true
+    - name: "qwen-1.5b"
+      ENGINE_MODEL_NAME: "Qwen/Qwen2.5-1.5B-Instruct"
+      requires_restart: true
+
+  prompts:
+    - name: "short-short"
+      file: "prompts/short_32tok.txt"
+      max_tokens: 32
+    - name: "short-long"
+      file: "prompts/short_32tok.txt"
+      max_tokens: 64
+    - name: "long-short"
+      file: "prompts/long_64tok.txt"
+      max_tokens: 32
+    - name: "long-long"
+      file: "prompts/long_64tok.txt"
+      max_tokens: 64
+
+  concurrency:
+    - name: "sequential"
+      mode: "sequential"
+      level: 1
+    - name: "concurrent-4"
+      mode: "concurrent"
+      level: 4
+    - name: "concurrent-8"
+      mode: "concurrent"
+      level: 8
+    - name: "stress-16"
+      mode: "concurrent"
+      level: 16
+
+  realistic:
+    - name: "realistic-standard"
+      duration_seconds: 300
+      rps: 1.0
+      prompt_pool: "all"  # samples uniformly from all prompt workloads
+    - name: "realistic-heavy"
+      duration_seconds: 300
+      rps: 4.0
+      prompt_pool: "all"
+
+  l1_cache:
+    - name: "l1-off"
+      SIDECAR_L1_CAPACITY_MB: 0
+      requires_restart: true
+    - name: "l1-256mb"
+      SIDECAR_L1_CAPACITY_MB: 256
+      SIDECAR_L1_NUM_BLOCKS: 512
+      requires_restart: true
+
+  engine_params:
+    - name: "default"
+      ENGINE_GPU_MEMORY_UTILIZATION: 0.70
+      ENGINE_MAX_MODEL_LEN: 128
+      ENGINE_DTYPE: "bfloat16"
+    - name: "high-mem"
+      ENGINE_GPU_MEMORY_UTILIZATION: 0.85
+      ENGINE_MAX_MODEL_LEN: 128
+      ENGINE_DTYPE: "bfloat16"
+
+  adapters:
+    - name: "base-only"
+      adapter: null
+    - name: "lora-guanaco"
+      adapter: "SeppeHousen/qwen-0.5B-qlora-guanaco"
+      ENGINE_ENABLE_LORA: true
+
+# Define which axis combinations to run (avoids full cartesian product)
+scenarios:
+  # Core: sweep prompts x concurrency with default model and engine params
+  - name: "core-sweep"
+    axes: [prompts, concurrency]
+    fixed:
+      model: "qwen-0.5b"
+      engine_params: "default"
+      l1_cache: "l1-256mb"
+      adapter: "base-only"
+
+  # Cache comparison: L1 on vs off
+  - name: "cache-comparison"
+    axes: [l1_cache, prompts]
+    fixed:
+      model: "qwen-0.5b"
+      concurrency: "concurrent-4"
+      engine_params: "default"
+      adapter: "base-only"
+
+  # Model comparison
+  - name: "model-comparison"
+    axes: [models]
+    fixed:
+      prompt: "long-long"
+      concurrency: "concurrent-4"
+      engine_params: "default"
+      l1_cache: "l1-256mb"
+      adapter: "base-only"
+
+  # Adapter overhead (LoRA adapter only compatible with 0.5B model)
+  - name: "adapter-overhead"
+    axes: [adapters]
+    fixed:
+      model: "qwen-0.5b"
+      prompt: "long-long"
+      concurrency: "sequential"
+      engine_params: "default"
+      l1_cache: "l1-256mb"
+
+  # Realistic production simulation
+  - name: "realistic-workload"
+    axes: [realistic]
+    fixed:
+      model: "qwen-0.5b"
+      engine_params: "default"
+      l1_cache: "l1-256mb"
+      adapter: "base-only"

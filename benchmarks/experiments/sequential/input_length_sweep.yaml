@@ -1,0 +1,64 @@
+# Experiment: Input Length Sweep
+# Sweeps input length with and without prefix caching.
+# Output is kept short (32 tokens) so decode doesn't dominate.
+# Engine restarts between groups to toggle prefix caching.
+
+experiment:
+  name: input_length_sweep
+  description: "TTFT scaling across input lengths (3840-12960 tokens), with and without prefix caching"
+
+  condition_groups:
+    - name: cache_disabled
+      engine_env:
+        ENGINE_ENABLE_PREFIX_CACHING: "false"
+      conditions:
+        nocache_input_3840:
+          input_length: 3840
+          max_tokens: 32
+        nocache_input_5760:
+          input_length: 5760
+          max_tokens: 32
+        nocache_input_8640:
+          input_length: 8640
+          max_tokens: 32
+        nocache_input_12960:
+          input_length: 12960
+          max_tokens: 32
+
+    - name: cache_enabled
+      engine_env:
+        ENGINE_ENABLE_PREFIX_CACHING: "true"
+      conditions:
+        cache_input_3840:
+          input_length: 3840
+          max_tokens: 32
+        cache_input_5760:
+          input_length: 5760
+          max_tokens: 32
+        cache_input_8640:
+          input_length: 8640
+          max_tokens: 32
+        cache_input_12960:
+          input_length: 12960
+          max_tokens: 32
+
+  dispatch:
+    mode: sequential
+
+  protocol:
+    warmup_requests: 3
+    runs: 3
+    prompts_per_condition: 1
+    repeat: 10
+    cooldown_seconds: 5
+
+  plots:
+    ttft_vs_input_length:
+      description: "TTFT vs input length with two curves: cache enabled and cache disabled"
+      x: input_length
+      y: stats.ttft.mean
+      series:
+        - label: "Cache disabled"
+          condition_group: cache_disabled
+        - label: "Cache enabled"
+          condition_group: cache_enabled
