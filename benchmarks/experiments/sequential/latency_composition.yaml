@@ -36,3 +36,14 @@ experiment:
     prompts_per_condition: 30
     cooldown_seconds: 5
 
+  plots:
+    latency_composition:
+      description: "Stacked bar chart decomposing e2e latency into prefill (TTFT) and decode time"
+      x: condition
+      y:
+        - label: "Prefill (TTFT)"
+          field: stats.ttft.mean
+        - label: "Decode"
+          field: stats.decode_time.mean
+      style: stacked_bar
+

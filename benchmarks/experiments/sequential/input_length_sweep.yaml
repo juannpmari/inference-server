@@ -1,10 +1,11 @@
-# Experiment: Prefix Caching Impact on TTFT
-# Dual-line comparison of TTFT with and without prefix caching across input lengths.
-# Uses condition_groups to toggle ENGINE_ENABLE_PREFIX_CACHING and restart between groups.
+# Experiment: Input Length Sweep
+# Sweeps input length with and without prefix caching.
+# Output is kept short (32 tokens) so decode doesn't dominate.
+# Engine restarts between groups to toggle prefix caching.
 
 experiment:
-  name: prefix_caching_ttft
-  description: "Impact of prefix caching on TTFT across input lengths (256 to 3840 tokens)"
+  name: input_length_sweep
+  description: "TTFT scaling across input lengths (3840-12960 tokens), with and without prefix caching"
 
   condition_groups:
     - name: cache_disabled
@@ -47,6 +48,16 @@ experiment:
   protocol:
     warmup_requests: 3
     runs: 3
-    prompts_per_condition: 1
-    repeat: 10
+    prompts_per_condition: 10
     cooldown_seconds: 5
+
+  plots:
+    ttft_vs_input_length:
+      description: "TTFT vs input length with two curves: cache enabled and cache disabled"
+      x: input_length
+      y: stats.ttft.mean
+      series:
+        - label: "Cache disabled"
+          condition_group: cache_disabled
+        - label: "Cache enabled"
+          condition_group: cache_enabled

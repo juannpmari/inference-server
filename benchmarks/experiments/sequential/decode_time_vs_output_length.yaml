@@ -29,3 +29,11 @@ experiment:
     runs: 3
     prompts_per_condition: 10
     cooldown_seconds: 5
+
+  plots:
+    decode_time_vs_output_length:
+      description: "Decode time scaling as output token count increases"
+      x: max_tokens
+      y: stats.decode_time.mean
+      series:
+        - label: "Decode time"

@@ -66,23 +66,110 @@ experiment:
     cooldown_seconds: 5
 ```
 
-## Step 6: Create the plotting script
+## Step 6: Define plots in the YAML
 
-Create `benchmarks/plotting/plot_<experiment_name>.py`. The script must:
+Every experiment YAML must include a `plots` key that declaratively describes the visualizations to produce from the results. This allows a generic plotter to render all plots without per-experiment scripts.
 
-1. Accept CLI args: `--input` (path to results JSON) and `--stat` (one of mean/p50/p90/p99, default mean).
-2. Load the JSON results file.
-3. Extract the relevant metrics from the results. Available metrics per condition:
-   - `stats.ttft` — time to first token: `{mean, p50, p90, p99}`
-   - `stats.decode_time` — decode phase duration: `{mean, p50, p90, p99}`
-   - `stats.itl` — inter-token latency: `{mean, p50, p90, p99}`
-   - `stats.e2e` — end-to-end latency: `{mean, p50, p90, p99}`
-   - `server_side_delta` — `{latency, throughput, kv_cache, errors}`
-   - `per_request` — array of individual request data
-4. Produce the visualization the user requested (matplotlib).
-5. Save the figure to `benchmarks/results/<experiment_name>.png`.
+### Plot definition protocol
 
-Look at existing plotting scripts in `benchmarks/plotting/` for style conventions before writing.
+```yaml
+  plots:
+    <plot_name>:
+      description: "Human-readable description of the plot"
+      x: <field>                    # x-axis data source (dot-path into condition config or results)
+      y: <field or list>            # y-axis data source(s)
+      series: [...]                 # optional: multiple curves/bars
+      style: <style>                # optional: rendering hint (default: line)
+```
+
+### Field references
+
+`x` and `y` fields use dot-notation paths that resolve against either:
+- **Condition config**: `input_length`, `max_tokens`, `dispatch.concurrency` — values from the YAML condition definition itself.
+- **Result metrics**: `stats.ttft.mean`, `stats.decode_time.p90`, `client_side_throughput.output_tokens_per_second`, etc.
+
+Available result metrics per condition:
+- `stats.ttft` — time to first token: `{mean, p50, p90, p99}`
+- `stats.decode_time` — decode phase duration: `{mean, p50, p90, p99}`
+- `stats.itl` — inter-token latency: `{mean, p50, p90, p99}`
+- `stats.e2e` — end-to-end latency: `{mean, p50, p90, p99}`
+- `client_side_throughput.output_tokens_per_second`
+- `server_side_delta` — `{latency, throughput, kv_cache, errors}`
+
+### Single y-field (one series)
+
+When `y` is a string, there's one data series. Use `series` to give it a label:
+
+```yaml
+    decode_time_vs_output_length:
+      x: max_tokens
+      y: stats.decode_time.mean
+      series:
+        - label: "Decode time"
+```
+
+### Multiple y-fields (multiple series from different metrics)
+
+When plotting several metrics on the same axes (e.g. percentile breakdown), `y` is a list:
+
+```yaml
+    ttft_vs_concurrency:
+      x: dispatch.concurrency
+      y:
+        - label: "Mean"
+          field: stats.ttft.mean
+        - label: "P50"
+          field: stats.ttft.p50
+        - label: "P90"
+          field: stats.ttft.p90
+        - label: "P99"
+          field: stats.ttft.p99
+```
+
+### Multiple series from condition groups
+
+When the experiment uses `condition_groups` and each group becomes a separate curve, reference it via `condition_group`:
+
+```yaml
+    ttft_vs_input_length:
+      x: input_length
+      y: stats.ttft.mean
+      series:
+        - label: "Cache disabled"
+          condition_group: cache_disabled
+        - label: "Cache enabled"
+          condition_group: cache_enabled
+```
+
+### Style hints
+
+Use `style` to indicate the plot type. The plotter uses this to select the rendering strategy:
+
+| Style | Use when |
+|-------|----------|
+| `line` (default) | Continuous metric vs ordered x-axis |
+| `stacked_bar` | Decomposing a total into parts (e.g. TTFT + decode = e2e) |
+| `scatter_pareto` | Scatter with Pareto frontier overlay |
+
+Example for stacked bar:
+
+```yaml
+    latency_composition:
+      x: condition
+      y:
+        - label: "Prefill (TTFT)"
+          field: stats.ttft.mean
+        - label: "Decode"
+          field: stats.decode_time.mean
+      style: stacked_bar
+```
+
+### Existing experiments as reference
+
+- `concurrent/concurrency_sweep.yaml` — 3 plots: line, multi-series percentile, scatter Pareto
+- `sequential/input_length_sweep.yaml` — condition_group-based series (cache on/off)
+- `sequential/latency_composition.yaml` — stacked bar
+- `sequential/decode_time_vs_output_length.yaml` — simple single-series line
 
 ## Step 7: Update documentation
 

@@ -666,6 +666,23 @@ async def run_experiment(
 
     logger.info("Final results written to %s", out)
 
+    # --- Generate plots defined in the YAML ---
+    plot_configs = exp.get("plots")
+    if plot_configs:
+        dispatch_mode = exp.get("dispatch", {}).get("mode", "sequential")
+        out_dir = str(Path(out).parent)
+        try:
+            if dispatch_mode == "concurrent":
+                from benchmarks.plotting.concurrency_plotter import ConcurrencyPlotter
+                saved = ConcurrencyPlotter.generate_plots(results, out_dir, plot_configs)
+            else:
+                from benchmarks.plotting.sequential_plotter import SequentialPlotter
+                saved = SequentialPlotter.generate_plots(results, out_dir, plot_configs)
+            for fpath in saved:
+                logger.info("Plot saved: %s", fpath)
+        except Exception:
+            logger.exception("Plot generation failed — results are still saved")
+
     return results
 
 

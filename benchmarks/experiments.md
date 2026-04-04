@@ -162,20 +162,29 @@ Plotting scripts select whichever metrics and aggregation they need from this st
 
 ## Current experiments
 
+### Summary table
+
+| # | Experiment | YAML | Plotter subcommand | Description |
+|---|---|---|---|---|
+| 1 | Latency Composition | `sequential/latency_composition.yaml` | `sequential_plotter latency` | Stacked barchart of prefill vs decode for SISO/SILO/LISO/LILO |
+| 2 | Input Length Sweep | `sequential/input_length_sweep.yaml` | `sequential_plotter ttft-input` / `prefix-cache` | TTFT scaling across input lengths, with and without prefix caching |
+| 3 | Decode Time vs Output Length | `sequential/decode_time_vs_output_length.yaml` | `sequential_plotter decode` | Decode time scaling from 3840 to 12960 output tokens |
+| 4 | Concurrency Sweep | `concurrent/concurrency_sweep.yaml` | `concurrency_plotter throughput` / `ttft` / `pareto` | Throughput, TTFT, and Pareto plots from a single concurrency sweep |
+
+---
+
 ### 1. Latency Composition
 
 **Goal:** Decompose end-to-end latency into prefill (TTFT) and decode phases across four input/output size combinations.
 
 **Conditions:**
 
-| Condition | Input tokens | Output tokens | Total |
-|-----------|-------------|---------------|-------|
-| SISO (Short In, Short Out) | 32 | 32 | 64 |
-| SILO (Short In, Long Out) | 32 | 512 | 544 |
-| LISO (Long In, Short Out) | 512 | 32 | 544 |
-| LILO (Long In, Long Out) | 512 | 512 | 1024 |
-
-Long inputs are built by concatenating 16 short (32-token) prompts (16 × 32 = 512 tokens).
+| Condition | Input tokens | Output tokens |
+|-----------|-------------|---------------|
+| SISO (Short In, Short Out) | 32 | 32 |
+| SILO (Short In, Long Out) | 32 | 320 |
+| LISO (Long In, Short Out) | 320 | 32 |
+| LILO (Long In, Long Out) | 320 | 320 |
 
 **Run:**
 ```bash
@@ -184,130 +193,89 @@ python3 -m benchmarks.experiment_orchestrator benchmarks/experiments/sequential/
 python3 -m benchmarks.experiment_orchestrator benchmarks/experiments/sequential/latency_composition.yaml --restart
 ```
 
-**Plot:**
+**Plot (optional):**
 ```bash
-python3 -m benchmarks.plotting.plot_latency_composition --input benchmarks/results/sequential/latency_composition/latency_composition.json --stat mean
+python3 -m benchmarks.plotting.sequential_plotter latency --stat mean
+# Custom input/output paths:
+python3 -m benchmarks.plotting.sequential_plotter latency --input benchmarks/results/sequential/latency_composition/latency_composition.json --stat p50
 ```
 
 **Output:** Stacked barchart showing prefill vs decode time for each condition.
 
 ---
 
-### 2. TTFT vs Input Length
+### 2. Input Length Sweep
 
-**Goal:** Measure how Time To First Token scales as input length increases from 32 to 256 tokens.
-
-**Conditions:** 8 conditions (`input_32` through `input_256`), with `input_length` increasing in steps of 32. Output is kept short (`max_tokens: 32`) so decode doesn't dominate.
-
-| Condition | Input tokens | Output tokens |
-|-----------|-------------|---------------|
-| input_32 | 32 | 32 |
-| input_64 | 64 | 32 |
-| input_96 | 96 | 32 |
-| input_128 | 128 | 32 |
-| input_160 | 160 | 32 |
-| input_192 | 192 | 32 |
-| input_224 | 224 | 32 |
-| input_256 | 256 | 32 |
-
-**Run:**
-```bash
-python3 -m benchmarks.experiment_orchestrator benchmarks/experiments/sequential/ttft_vs_input_length.yaml --restart
-```
-
-**Plot:**
-```bash
-python3 -m benchmarks.plotting.plot_ttft_vs_input_length --input benchmarks/results/sequential/ttft_vs_input_length/ttft_vs_input_length.json --stat p90 --no-scatter
-```
-
-**Output:** Line plot with individual request scatter, stat trend line, and linear fit showing TTFT scaling rate in ms/token.
-
----
-
-### 3. Prefix Caching Impact on TTFT
-
-**Goal:** Measure how prefix caching affects TTFT across input lengths from 32 to 256 tokens.
+**Goal:** Measure how TTFT scales as input length increases from 3840 to 12960 tokens, with and without prefix caching.
 
 **Design:** Uses `condition_groups` to run all input lengths first with prefix caching disabled, then restart the engine with prefix caching enabled and repeat. This ensures clean cache state for each group.
 
-**Conditions:** 16 conditions across 2 groups:
+**Conditions:** 8 conditions across 2 groups:
 
 | Group | Condition | Cache | Input tokens | Output tokens |
 |-------|-----------|-------|-------------|---------------|
-| cache_disabled | nocache_input_32 | OFF | 32 | 32 |
-| cache_disabled | nocache_input_64 | OFF | 64 | 32 |
-| cache_disabled | nocache_input_96 | OFF | 96 | 32 |
-| cache_disabled | nocache_input_128 | OFF | 128 | 32 |
-| cache_disabled | nocache_input_160 | OFF | 160 | 32 |
-| cache_disabled | nocache_input_192 | OFF | 192 | 32 |
-| cache_disabled | nocache_input_224 | OFF | 224 | 32 |
-| cache_disabled | nocache_input_256 | OFF | 256 | 32 |
-| cache_enabled | cache_input_32 | ON | 32 | 32 |
-| cache_enabled | cache_input_64 | ON | 64 | 32 |
-| cache_enabled | cache_input_96 | ON | 96 | 32 |
-| cache_enabled | cache_input_128 | ON | 128 | 32 |
-| cache_enabled | cache_input_160 | ON | 160 | 32 |
-| cache_enabled | cache_input_192 | ON | 192 | 32 |
-| cache_enabled | cache_input_224 | ON | 224 | 32 |
-| cache_enabled | cache_input_256 | ON | 256 | 32 |
+| cache_disabled | nocache_input_3840 | OFF | 3840 | 32 |
+| cache_disabled | nocache_input_5760 | OFF | 5760 | 32 |
+| cache_disabled | nocache_input_8640 | OFF | 8640 | 32 |
+| cache_disabled | nocache_input_12960 | OFF | 12960 | 32 |
+| cache_enabled | cache_input_3840 | ON | 3840 | 32 |
+| cache_enabled | cache_input_5760 | ON | 5760 | 32 |
+| cache_enabled | cache_input_8640 | ON | 8640 | 32 |
+| cache_enabled | cache_input_12960 | ON | 12960 | 32 |
 
 **Run:**
 ```bash
-python3 -m benchmarks.experiment_orchestrator benchmarks/experiments/sequential/prefix_caching_ttft.yaml --restart
+python3 -m benchmarks.experiment_orchestrator benchmarks/experiments/sequential/input_length_sweep.yaml --restart
 ```
 
-**Plot:**
+**Plot (optional) — TTFT vs input length (cache-disabled group only):**
 ```bash
-python3 -m benchmarks.plotting.plot_prefix_caching_ttft --input benchmarks/results/sequential/prefix_caching_ttft/prefix_caching_ttft.json --stat mean --no-scatter
+python3 -m benchmarks.plotting.sequential_plotter ttft-input --stat p90
+python3 -m benchmarks.plotting.sequential_plotter ttft-input --stat mean --no-scatter
 ```
 
-**Output:** Dual-line plot comparing TTFT with and without prefix caching across input lengths, with individual request scatter points.
+**Plot (optional) — prefix caching comparison (both groups):**
+```bash
+python3 -m benchmarks.plotting.sequential_plotter prefix-cache --stat mean
+python3 -m benchmarks.plotting.sequential_plotter prefix-cache --stat mean --no-scatter
+```
+
+
+**Output:** Line plot of TTFT vs input length with linear fit, or dual-line comparison with/without prefix caching.
 
 ---
 
-### Summary table
+### 3. Decode Time vs Output Length
 
-| Experiment | YAML | Plot script | Description |
-|---|---|---|---|
-| Latency Composition | `latency_composition.yaml` | `plot_latency_composition` | Stacked barchart of prefill vs decode for SISO/SILO/LISO/LILO |
-| TTFT vs Input Length | `ttft_vs_input_length.yaml` | `plot_ttft_vs_input_length` | Line plot of TTFT scaling from 32 to 256 input tokens |
-| Prefix Caching TTFT | `prefix_caching_ttft.yaml` | `plot_prefix_caching_ttft` | Dual-line TTFT comparison with/without prefix caching |
-| Decode Time vs Output Length | `decode_time_vs_output_length.yaml` | `plot_decode_time_vs_output_length` | Line plot of decode time scaling from 32 to 768 output tokens |
-| Throughput vs Concurrency | `throughput_vs_concurrency.yaml` | `plot_throughput_vs_concurrency` | Line plot of output tok/s scaling across concurrency levels 4–64 |
-| TTFT vs Concurrency | `ttft_vs_concurrency.yaml` | `plot_ttft_vs_concurrency` | Multi-line plot of mean/p50/p90/p99 TTFT across concurrency levels 4–64 |
-| Throughput vs Latency Pareto | `throughput_latency_pareto.yaml` | `plot_throughput_latency_pareto` | Pareto frontier of throughput vs e2e latency across concurrency levels 1–64 |
+**Goal:** Measure how decode time scales as output token count increases from 3840 to 12960 tokens (fixed 32-token input).
 
-### 4. Decode Time vs Output Length
-
-**Goal:** Measure how decode time scales as output token count increases from 32 to 768 tokens (fixed 32-token input).
-
-**Conditions:** 24 conditions (`output_32` through `output_768`), all with `input_length: 32` and `max_tokens` increasing in steps of 32.
+**Conditions:** 4 conditions with `input_length: 32` and increasing `max_tokens`:
 
 | Condition | Input tokens | Output tokens |
 |-----------|-------------|---------------|
-| output_32 | 32 | 32 |
-| output_64 | 32 | 64 |
-| output_96 | 32 | 96 |
-| ... | 32 | ... |
-| output_768 | 32 | 768 |
+| output_3840 | 32 | 3840 |
+| output_5760 | 32 | 5760 |
+| output_8640 | 32 | 8640 |
+| output_12960 | 32 | 12960 |
 
 **Run:**
 ```bash
 python3 -m benchmarks.experiment_orchestrator benchmarks/experiments/sequential/decode_time_vs_output_length.yaml
 ```
 
-**Plot:**
+**Plot (optional):**
 ```bash
-python3 -m benchmarks.plotting.plot_decode_time_vs_output_length --input benchmarks/results/sequential/decode_time_vs_output_length/decode_time_vs_output_length.json --stat mean
+python3 -m benchmarks.plotting.sequential_plotter decode --stat mean
+python3 -m benchmarks.plotting.sequential_plotter decode --stat p90 --no-scatter
 ```
 
 **Output:** Line plot with individual request scatter, stat trend line, and linear fit showing decode time scaling rate in ms/token.
 
 ---
 
-### 5. Throughput vs Concurrency
+### 4. Concurrency Sweep
 
-**Goal:** Measure how aggregate output token throughput (tok/s) scales as the number of concurrent requests increases. All conditions use the same prompt size; only concurrency varies.
+**Goal:** Sweep concurrency levels to measure throughput scaling, TTFT degradation, and the throughput–latency Pareto frontier — all from a single experiment run.
 
 **Conditions:** 5 conditions with fixed input/output size and increasing concurrency:
 
@@ -323,91 +291,41 @@ Each condition uses a per-condition `dispatch.concurrency` override. Concurrency
 
 **Run:**
 ```bash
-python3 -m benchmarks.experiment_orchestrator benchmarks/experiments/concurrent/throughput_vs_concurrency.yaml --restart
+python3 -m benchmarks.experiment_orchestrator benchmarks/experiments/concurrent/concurrency_sweep.yaml
+# Use --restart to restart the engine between conditions:
+python3 -m benchmarks.experiment_orchestrator benchmarks/experiments/concurrent/concurrency_sweep.yaml --restart
 ```
 
-**Plot:**
+**Plot (optional) — throughput vs concurrency:**
 ```bash
-python3 -m benchmarks.plotting.plot_throughput_vs_concurrency --input benchmarks/results/concurrent/throughput_vs_concurrency/throughput_vs_concurrency.json
-# Use server-side throughput instead:
-python3 -m benchmarks.plotting.plot_throughput_vs_concurrency --input benchmarks/results/concurrent/throughput_vs_concurrency/throughput_vs_concurrency.json --source server
-```
-
-**Output:** Line plot of output token throughput (tok/s) vs concurrency level, with annotated data points.
-
----
-
-### 6. TTFT vs Concurrency
-
-**Goal:** Measure how Time To First Token (and its tail latency) changes as the number of concurrent requests increases. Shows mean, p50, p90, and p99 simultaneously to reveal how tail latency diverges under load.
-
-**Conditions:** 5 conditions with fixed input/output size and increasing concurrency:
-
-| Condition | Input tokens | Output tokens | Concurrency |
-|-----------|-------------|---------------|-------------|
-| concurrency_4 | 32 | 128 | 4 |
-| concurrency_8 | 32 | 128 | 8 |
-| concurrency_16 | 32 | 128 | 16 |
-| concurrency_32 | 32 | 128 | 32 |
-| concurrency_64 | 32 | 128 | 64 |
-
-Each condition uses a per-condition `dispatch.concurrency` override.
-
-**Run:**
-```bash
-python3 -m benchmarks.experiment_orchestrator benchmarks/experiments/concurrent/ttft_vs_concurrency.yaml
-```
-
-**Plot:**
-```bash
-python3 -m benchmarks.plotting.plot_ttft_vs_concurrency --input benchmarks/results/concurrent/ttft_vs_concurrency/ttft_vs_concurrency.json
-# Hide per-request scatter points:
-python3 -m benchmarks.plotting.plot_ttft_vs_concurrency --input benchmarks/results/concurrent/ttft_vs_concurrency/ttft_vs_concurrency.json --no-scatter
-```
-
-**Output:** Multi-line plot showing mean, p50, p90, and p99 TTFT (in ms) vs concurrency level, with optional per-request scatter. P99 values are annotated on the chart.
-
----
-
-### 7. Throughput vs Latency Pareto Frontier
-
-**Goal:** Identify the Pareto-optimal concurrency levels in throughput–latency space. Each concurrency level produces a (latency, throughput) point; the Pareto frontier connects points where throughput cannot be improved without increasing latency. This reveals the best concurrency level for a given latency budget.
-
-**Conditions:** 7 conditions with fixed input/output size and increasing concurrency:
-
-| Condition | Input tokens | Output tokens | Concurrency |
-|-----------|-------------|---------------|-------------|
-| n_1 | 128 | 128 | 1 |
-| n_2 | 128 | 128 | 2 |
-| n_4 | 128 | 128 | 4 |
-| n_8 | 128 | 128 | 8 |
-| n_16 | 128 | 128 | 16 |
-| n_32 | 128 | 128 | 32 |
-| n_64 | 128 | 128 | 64 |
-
-Each condition uses a per-condition `dispatch.concurrency` override.
-
-**Run:**
-```bash
-python3 -m benchmarks.experiment_orchestrator benchmarks/experiments/concurrent/throughput_latency_pareto.yaml
-```
-
-**Plot:**
-```bash
-python3 -m benchmarks.plotting.plot_throughput_latency_pareto --input benchmarks/results/concurrent/throughput_latency_pareto/throughput_latency_pareto.json --stat mean
-# Use p90 latency instead:
-python3 -m benchmarks.plotting.plot_throughput_latency_pareto --input benchmarks/results/concurrent/throughput_latency_pareto/throughput_latency_pareto.json --stat p90
+python3 -m benchmarks.plotting.concurrency_plotter throughput
 # Use server-side throughput:
-python3 -m benchmarks.plotting.plot_throughput_latency_pareto --input benchmarks/results/concurrent/throughput_latency_pareto/throughput_latency_pareto.json --source server
+python3 -m benchmarks.plotting.concurrency_plotter throughput --source server
 ```
 
-**Output:** Scatter plot with all concurrency levels labeled. Pareto-optimal points are connected by a frontier line and highlighted in bold. Dominated points appear faded.
+**Plot (optional) — TTFT vs concurrency:**
+```bash
+python3 -m benchmarks.plotting.concurrency_plotter ttft
+# Hide per-request scatter points:
+python3 -m benchmarks.plotting.concurrency_plotter ttft --no-scatter
+```
+
+**Plot (optional) — throughput-latency Pareto frontier:**
+```bash
+python3 -m benchmarks.plotting.concurrency_plotter pareto --stat mean
+# Use p90 latency:
+python3 -m benchmarks.plotting.concurrency_plotter pareto --stat p90
+# Use server-side throughput:
+python3 -m benchmarks.plotting.concurrency_plotter pareto --source server
+```
+
+**Output:** Throughput line plot, multi-stat TTFT line plot, or Pareto scatter with frontier line — depending on subcommand.
 
 ---
 
 ## Adding a new experiment
 
-1. Create `benchmarks/experiments/<name>.yaml` following the YAML format above.
-2. Run it: `python3 -m benchmarks.experiment_orchestrator benchmarks/experiments/<name>.yaml`
-3. Create `benchmarks/plotting/plot_<name>.py` that reads from `benchmarks/results/<dispatch_mode>/<name>.json`.
-4. Add a row to the table above.
+1. Create `benchmarks/experiments/<dispatch_mode>/<name>.yaml` following the YAML format above.
+2. Run it: `python3 -m benchmarks.experiment_orchestrator benchmarks/experiments/<dispatch_mode>/<name>.yaml`
+3. Add a plot method to the appropriate plotter (`sequential_plotter.py` or `concurrency_plotter.py`) and register it in `PLOT_REGISTRY`.
+4. Add a row to the summary table above.
