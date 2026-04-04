@@ -48,7 +48,7 @@ VALID_STATS = ("mean", "p50", "p90", "p99")
 # Plot
 # ---------------------------------------------------------------------------
 
-def plot_prefix_caching_ttft(data: dict, out_dir: str, stat: str = "mean") -> str:
+def plot_prefix_caching_ttft(data: dict, out_dir: str, stat: str = "mean", scatter: bool = True) -> str:
     conditions = data["conditions"]
 
     series: dict[str, list[tuple[float, float, list[float]]]] = {
@@ -88,11 +88,12 @@ def plot_prefix_caching_ttft(data: dict, out_dir: str, stat: str = "mean") -> st
         per_req = [s[2] for s in series[series_key]]
 
         # Scatter individual requests
-        for tok, reqs in zip(tokens, per_req):
-            xs = np.full(len(reqs), tok) + jitter_offset
-            jitter = np.random.default_rng(42).uniform(-1, 1, size=len(reqs))
-            ax.scatter(xs + jitter, np.array(reqs) * 1000, s=20, alpha=0.3,
-                       color=COLORS[f"{color_prefix}_scatter"], edgecolors="none", zorder=2)
+        if scatter:
+            for tok, reqs in zip(tokens, per_req):
+                xs = np.full(len(reqs), tok) + jitter_offset
+                jitter = np.random.default_rng(42).uniform(-1, 1, size=len(reqs))
+                ax.scatter(xs + jitter, np.array(reqs) * 1000, s=20, alpha=0.3,
+                           color=COLORS[f"{color_prefix}_scatter"], edgecolors="none", zorder=2)
 
         # Line for the chosen stat
         ax.plot(tokens, np.array(vals) * 1000, "o-", color=COLORS[f"{color_prefix}_line"],
@@ -117,6 +118,8 @@ def main():
     parser.add_argument("--dispatch-mode", default="sequential", help="Dispatch mode subfolder (default: %(default)s)")
     parser.add_argument("--stat", default="mean", choices=VALID_STATS,
                         help="Which aggregation to plot (default: mean)")
+    parser.add_argument("--no-scatter", action="store_true",
+                        help="Hide individual request points, show only the aggregated lines")
     args = parser.parse_args()
 
     results_dir = Path(__file__).resolve().parent.parent / "results" / args.dispatch_mode / "prefix_caching_ttft"
@@ -127,7 +130,7 @@ def main():
         data = json.load(f)
 
     os.makedirs(output_dir, exist_ok=True)
-    fpath = plot_prefix_caching_ttft(data, output_dir, stat=args.stat)
+    fpath = plot_prefix_caching_ttft(data, output_dir, stat=args.stat, scatter=not args.no_scatter)
     print(f"Saved: {fpath}")
 
 

@@ -42,7 +42,7 @@ PROMPTS_DIR = BENCHMARKS_DIR / "prompts"
 class BenchmarkClient:
     """Minimal SSE streaming client for the engine /generate/stream endpoint."""
 
-    def __init__(self, engine_url: str, max_connections: int = 50):
+    def __init__(self, engine_url: str, max_connections: int = 100):
         self.engine_url = engine_url.rstrip("/")
         self.http = httpx.AsyncClient(
             timeout=httpx.Timeout(connect=10.0, read=120.0, write=10.0, pool=30.0),
@@ -133,13 +133,15 @@ class BenchmarkClient:
 TOKENS_PER_PROMPT = 32
 
 
-def load_prompts(input_length: int, max_tokens: int, limit: int | None = None) -> list[Prompt]:
+def load_prompts(input_length: int, max_tokens: int, limit: int | None = None, repeat: int = 1) -> list[Prompt]:
     """Load prompts from data/, concatenating to reach the desired input length.
 
     Args:
         input_length: Desired input length in tokens (must be divisible by 32).
         max_tokens: max_tokens to set on each Prompt.
-        limit: Max number of final prompts to produce.
+        limit: Max number of unique prompts to produce.
+        repeat: How many times to repeat the prompt list. Useful for prefix
+                caching experiments where cache hits require identical prompts.
     """
     if input_length % TOKENS_PER_PROMPT != 0:
         raise ValueError(f"input_length ({input_length}) must be divisible by {TOKENS_PER_PROMPT}")
@@ -174,7 +176,7 @@ def load_prompts(input_length: int, max_tokens: int, limit: int | None = None) -
 
     if limit:
         prompts = prompts[:limit]
-    return prompts
+    return prompts * repeat
 
 
 # ---------------------------------------------------------------------------
@@ -250,8 +252,10 @@ async def run_condition(
         input_length=condition_cfg["input_length"],
         max_tokens=condition_cfg["max_tokens"],
         limit=protocol.get("prompts_per_condition"),
+        repeat=protocol.get("repeat", 1),
     )
-    dispatcher = make_dispatcher(client, prompts, dispatch_cfg)
+    effective_dispatch = {**dispatch_cfg, **condition_cfg.get("dispatch", {})}
+    dispatcher = make_dispatcher(client, prompts, effective_dispatch)
 
     warmup_n = protocol.get("warmup_requests", 3)
     num_runs = protocol.get("runs", 3)
@@ -293,6 +297,15 @@ async def run_condition(
     all_itl = [itl for r in ok for itl in r.itl]
     decode_times = [r.e2e - r.ttft for r in ok]
 
+    # Client-side aggregate throughput
+    total_output_tokens = sum(r.output_tokens for r in ok)
+    wall_clock = max(r.e2e for r in ok) if ok else 0.0
+    client_throughput = {
+        "total_output_tokens": total_output_tokens,
+        "wall_clock_seconds": round(wall_clock, 6),
+        "output_tokens_per_second": round(total_output_tokens / wall_clock, 2) if wall_clock > 0 else 0.0,
+    }
+
     def percentiles(vals):
         if not vals:
             return {"mean": 0.0, "p50": 0.0, "p90": 0.0, "p99": 0.0}
@@ -307,9 +320,11 @@ async def run_condition(
         "condition": condition_name,
         "input_length": condition_cfg["input_length"],
         "max_tokens": condition_cfg["max_tokens"],
+        "dispatch": effective_dispatch,
         "total_requests": len(median_records),
         "successful_requests": len(ok),
         "failed_requests": len(median_records) - len(ok),
+        "client_side_throughput": client_throughput,
         "stats": {
             "ttft": percentiles(ttfts),
             "decode_time": percentiles(decode_times),
@@ -431,6 +446,7 @@ async def run_experiment(experiment_path: str, engine_url: str, output_path: str
         "experiment": exp["name"],
         "description": exp.get("description", ""),
         "dispatch_mode": dispatch_cfg["mode"],
+        "dispatch_config": dispatch_cfg,
         "conditions": {},
     }
 

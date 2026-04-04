@@ -17,7 +17,7 @@ engine:
   host: "0.0.0.0"
   port: 8080
   model_name: "Qwen/Qwen2-0.5B-Instruct"
-  max_model_len: 512
+  max_model_len: 16000
   gpu_memory_utilization: 0.70
   dtype: "bfloat16"
   max_pending: 10

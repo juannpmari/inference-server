@@ -380,15 +380,37 @@ async def metrics_summary():
         power = gpu_summary.get("current", {}).get("power_watts", 0.0)
         summary["gpu"]["tokens_per_watt"] = round(output_tps / power, 4) if power > 0 else 0.0
 
+    # Read vLLM prefix cache metrics from Prometheus registry.
+    # vLLM registers gauges like "vllm:gpu_prefix_cache_hit_rate";
+    # prometheus_client normalises colons to underscores in metric.name.
+    vllm_cache = {}
+    _VLLM_CACHE_METRICS = {
+        "vllm:gpu_prefix_cache_hit_rate": "hit_rate",
+        "vllm:gpu_cache_usage_perc": "gpu_cache_usage_perc",
+    }
+    try:
+        for metric in REGISTRY.collect():
+            name = metric.name
+            # Check both colon and underscore forms
+            for vllm_name, key in _VLLM_CACHE_METRICS.items():
+                if name == vllm_name or name == vllm_name.replace(":", "_"):
+                    for sample in metric.samples:
+                        vllm_cache[key] = sample.value
+    except Exception as e:
+        logger.warning(f"Failed to read vLLM cache metrics: {e}")
+    if vllm_cache:
+        summary.setdefault("kv_cache", {}).update(vllm_cache)
+
     # Merge KV cache data from sidecar (graceful degradation)
     if _config and _config.sidecar_url:
         try:
             async with httpx.AsyncClient(timeout=3.0) as client:
                 resp = await client.get(f"{_config.sidecar_url}/cache/stats")
                 if resp.status_code == 200:
-                    summary["kv_cache"] = resp.json()
+                    sidecar_stats = resp.json()
+                    sidecar_stats.pop("hit_rate", None)  # sidecar hit_rate is broken; use vLLM's
+                    summary.setdefault("kv_cache", {}).update(sidecar_stats)
         except Exception as e:
             logger.warning(f"Failed to fetch sidecar cache stats: {e}")
-            # kv_cache stays as empty dict from collector
 
     return summary

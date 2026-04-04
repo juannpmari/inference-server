@@ -1,0 +1,31 @@
+# Experiment: Decode Time vs Output Length
+# Line plot of decode time as a function of output token count.
+# Input is kept short (32 tokens) so prefill doesn't dominate.
+# Output length is varied across 4 values matching the TTFT experiment.
+
+experiment:
+  name: decode_time_vs_output_length
+  description: "Decode time scaling as output length increases (3840 to 12960 tokens)"
+
+  conditions:
+    output_3840:
+      input_length: 32
+      max_tokens: 3840
+    output_5760:
+      input_length: 32
+      max_tokens: 5760
+    output_8640:
+      input_length: 32
+      max_tokens: 8640
+    output_12960:
+      input_length: 32
+      max_tokens: 12960
+
+  dispatch:
+    mode: sequential
+
+  protocol:
+    warmup_requests: 3
+    runs: 3
+    prompts_per_condition: 10
+    cooldown_seconds: 5

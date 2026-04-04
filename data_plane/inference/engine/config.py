@@ -11,7 +11,7 @@ class EngineConfig(BaseSettings):
     }
 
     model_name: str = "Qwen/Qwen2-0.5B"
-    max_model_len: int = 1024
+    max_model_len: int = 4000
     gpu_memory_utilization: float = 0.70
     dtype: str = "bfloat16"
     host: str = "0.0.0.0"
@@ -25,7 +25,7 @@ class EngineConfig(BaseSettings):
     max_lora_rank: int = 16
     adapter_poll_interval: float = 1.0
     adapter_poll_timeout: float = 600.0
-    max_pending: int = 100
+    max_pending: int = 200
     temperature: float = 0.0
     sidecar_grpc_url: str = "localhost:50051"
     enable_prefix_caching: bool = False
