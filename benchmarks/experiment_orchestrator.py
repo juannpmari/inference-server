@@ -300,6 +300,10 @@ def compute_delta(before: dict, after: dict) -> dict:
                 "total_errors": after.get("errors", {}).get("total_errors", 0) - before.get("errors", {}).get("total_errors", 0),
                 "error_rate": after.get("errors", {}).get("error_rate", 0.0),
             },
+            "queue": {
+                "max_depth": after.get("queue", {}).get("max_depth", 0),
+                "current_depth": after.get("queue", {}).get("current_depth", 0),
+            },
         }
     except Exception:
         return {}
@@ -327,12 +331,17 @@ async def run_condition(
     effective_dispatch = {**dispatch_cfg, **condition_cfg.get("dispatch", {})}
     dispatcher = make_dispatcher(client, prompts, effective_dispatch)
 
-    warmup_n = protocol.get("warmup_requests", 3)
     num_runs = protocol.get("runs", 3)
     cooldown = protocol.get("cooldown_seconds", 5)
 
-    logger.info("--- Condition '%s': warmup (%d requests) ---", condition_name, warmup_n)
-    await dispatcher.warmup(n=warmup_n)
+    warmup_duration = protocol.get("warmup_duration_seconds")
+    if warmup_duration and isinstance(dispatcher, RealisticDispatcher):
+        logger.info("--- Condition '%s': timed warmup (%ds) ---", condition_name, warmup_duration)
+        await dispatcher.warmup_timed(warmup_duration)
+    else:
+        warmup_n = protocol.get("warmup_requests", 3)
+        logger.info("--- Condition '%s': warmup (%d requests) ---", condition_name, warmup_n)
+        await dispatcher.warmup(n=warmup_n)
 
     all_runs: list[list[ResponseRecord]] = []
     deltas: list[dict] = []
@@ -639,6 +648,22 @@ async def run_experiment(
                     timeout=timeout,
                 )
                 results["conditions"][cond_name] = result
+
+                # --- Saturation detection ---
+                sat_threshold = protocol.get("saturation_threshold")
+                if sat_threshold and "stats" in result:
+                    p99 = result["stats"]["ttft"]["p99"]
+                    p50 = result["stats"]["ttft"]["p50"]
+                    if p50 > 0 and p99 > sat_threshold * p50:
+                        result["saturation_detected"] = True
+                        logger.warning(
+                            "SATURATION at '%s': TTFT p99=%.4fs > %.1f x p50=%.4fs",
+                            cond_name, p99, sat_threshold, p50,
+                        )
+                        if protocol.get("stop_on_saturation", False):
+                            break
+                    else:
+                        result["saturation_detected"] = False
             except asyncio.TimeoutError:
                 logger.warning("Condition '%s' timed out after %ds — skipping", cond_name, timeout)
                 results["conditions"][cond_name] = {
@@ -675,6 +700,9 @@ async def run_experiment(
             if dispatch_mode == "concurrent":
                 from benchmarks.plotting.concurrency_plotter import ConcurrencyPlotter
                 saved = ConcurrencyPlotter.generate_plots(results, out_dir, plot_configs)
+            elif dispatch_mode == "realistic":
+                from benchmarks.plotting.realistic_plotter import RealisticPlotter
+                saved = RealisticPlotter.generate_plots(results, out_dir, plot_configs)
             else:
                 from benchmarks.plotting.sequential_plotter import SequentialPlotter
                 saved = SequentialPlotter.generate_plots(results, out_dir, plot_configs)

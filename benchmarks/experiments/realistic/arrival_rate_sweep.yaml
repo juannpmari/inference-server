@@ -1,0 +1,121 @@
+# Experiment: Arrival Rate Sweep (Realistic / Poisson)
+# Sweeps Poisson arrival rates from 2 to 10 rps with prefix caching
+# enabled and disabled. Produces throughput-vs-arrival-rate, queue-depth,
+# and TTFT percentile plots comparing cache on vs off.
+
+experiment:
+  name: arrival_rate_sweep
+  description: "Poisson arrival-rate sweep (input=32, output=32) with cache on/off"
+
+  condition_groups:
+    - name: cache_disabled
+      engine_env:
+        ENGINE_ENABLE_PREFIX_CACHING: "false"
+      conditions:
+        nocache_rps_1_0:
+          input_length: 32
+          max_tokens: 32
+          dispatch:
+            rps: 1.0
+        nocache_rps_5_0:
+          input_length: 32
+          max_tokens: 32
+          dispatch:
+            rps: 5.0
+        # nocache_rps_6_0:
+        #   input_length: 32
+        #   max_tokens: 32
+        #   dispatch:
+        #     rps: 6.0
+        nocache_rps_8_0:
+          input_length: 32
+          max_tokens: 32
+          dispatch:
+            rps: 8.0
+        nocache_rps_10_0:
+          input_length: 32
+          max_tokens: 32
+          dispatch:
+            rps: 10.0
+
+    - name: cache_enabled
+      engine_env:
+        ENGINE_ENABLE_PREFIX_CACHING: "true"
+      conditions:
+        cache_rps_1_0:
+          input_length: 32
+          max_tokens: 32
+          dispatch:
+            rps: 1.0
+        cache_rps_5_0:
+          input_length: 32
+          max_tokens: 32
+          dispatch:
+            rps: 5.0
+        # cache_rps_6_0:
+        #   input_length: 32
+        #   max_tokens: 32
+        #   dispatch:
+        #     rps: 6.0
+        cache_rps_8_0:
+          input_length: 32
+          max_tokens: 32
+          dispatch:
+            rps: 8.0
+        cache_rps_10_0:
+          input_length: 32
+          max_tokens: 32
+          dispatch:
+            rps: 10.0
+
+  dispatch:
+    mode: realistic
+    rps: 1.0              # default, overridden per-condition
+    duration_seconds: 150
+    drain_timeout_seconds: 60
+    seed: 42
+
+  protocol:
+    warmup_duration_seconds: 60
+    runs: 1
+    prompts_per_condition: 50
+    cooldown_seconds: 15
+    saturation_threshold: 3.0
+    stop_on_saturation: false
+
+  plots:
+    throughput_vs_arrival_rate:
+      description: "Output throughput scaling with Poisson arrival rate (cache on vs off)"
+      x: dispatch.rps
+      y: client_side_throughput.output_tokens_per_second
+      series:
+        - label: "Cache disabled"
+          condition_group: cache_disabled
+        - label: "Cache enabled"
+          condition_group: cache_enabled
+
+    queue_depth_vs_arrival_rate:
+      description: "Server queue depth growth with arrival rate (cache on vs off)"
+      x: dispatch.rps
+      y: server_side_delta.queue.max_depth
+      series:
+        - label: "Cache disabled"
+          condition_group: cache_disabled
+        - label: "Cache enabled"
+          condition_group: cache_enabled
+
+    ttft_vs_arrival_rate:
+      description: "TTFT percentile breakdown across arrival rates (cache on vs off)"
+      x: dispatch.rps
+      y:
+        - label: "P50"
+          field: stats.ttft.p50
+        - label: "P90"
+          field: stats.ttft.p90
+        - label: "P99"
+          field: stats.ttft.p99
+      series:
+        - label: "Cache disabled"
+          condition_group: cache_disabled
+        - label: "Cache enabled"
+          condition_group: cache_enabled

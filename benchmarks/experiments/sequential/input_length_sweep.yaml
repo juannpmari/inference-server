@@ -48,7 +48,8 @@ experiment:
   protocol:
     warmup_requests: 3
     runs: 3
-    prompts_per_condition: 10
+    prompts_per_condition: 1
+    repeat: 10
     cooldown_seconds: 5
 
   plots:

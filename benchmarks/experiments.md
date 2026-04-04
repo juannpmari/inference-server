@@ -170,6 +170,7 @@ Plotting scripts select whichever metrics and aggregation they need from this st
 | 2 | Input Length Sweep | `sequential/input_length_sweep.yaml` | `sequential_plotter ttft-input` / `prefix-cache` | TTFT scaling across input lengths, with and without prefix caching |
 | 3 | Decode Time vs Output Length | `sequential/decode_time_vs_output_length.yaml` | `sequential_plotter decode` | Decode time scaling from 3840 to 12960 output tokens |
 | 4 | Concurrency Sweep | `concurrent/concurrency_sweep.yaml` | `concurrency_plotter throughput` / `ttft` / `pareto` | Throughput, TTFT, and Pareto plots from a single concurrency sweep |
+| 5 | Arrival Rate Sweep | `realistic/arrival_rate_sweep.yaml` | `realistic_plotter throughput` / `queue-depth` / `ttft` | Throughput, queue depth, and TTFT under increasing Poisson arrival rates |
 
 ---
 
@@ -320,6 +321,36 @@ python3 -m benchmarks.plotting.concurrency_plotter pareto --source server
 ```
 
 **Output:** Throughput line plot, multi-stat TTFT line plot, or Pareto scatter with frontier line — depending on subcommand.
+
+---
+
+### 5. Arrival Rate Sweep
+
+**Goal:** Measure throughput, queue depth, and TTFT under increasing Poisson arrival rates with cache on/off.
+
+**Conditions:** 20 per group (lambda 0.5–10.0), with `input_length: 1920` and `max_tokens: 128`.
+
+**Run:**
+```bash
+python3 -m benchmarks.experiment_orchestrator benchmarks/experiments/realistic/arrival_rate_sweep.yaml
+```
+
+**Plot (optional) — throughput vs arrival rate:**
+```bash
+python3 -m benchmarks.plotting.realistic_plotter throughput
+```
+
+**Plot (optional) — queue depth vs arrival rate:**
+```bash
+python3 -m benchmarks.plotting.realistic_plotter queue-depth
+```
+
+**Plot (optional) — TTFT percentiles vs arrival rate:**
+```bash
+python3 -m benchmarks.plotting.realistic_plotter ttft
+```
+
+**Output:** 3 plots — throughput vs arrival rate, queue depth vs arrival rate, TTFT percentiles vs arrival rate.
 
 ---
 

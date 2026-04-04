@@ -1,5 +1,6 @@
 import asyncio
 import logging
+import threading
 from contextlib import asynccontextmanager
 from typing import Optional
 from uuid import uuid4
@@ -51,6 +52,27 @@ _config = None
 _collector: Optional[SessionCollector] = None
 _gpu_monitor: Optional[GPUMonitor] = None
 _flusher: Optional[BackgroundFlusher] = None
+
+# Track high-water mark of vLLM's internal num_requests_waiting gauge.
+_vllm_waiting_lock = threading.Lock()
+_vllm_max_requests_waiting: float = 0.0
+
+_VLLM_WAITING_NAMES = {"vllm:num_requests_waiting", "vllm_num_requests_waiting"}
+
+
+def _sample_vllm_waiting() -> None:
+    """Read vllm:num_requests_waiting from the Prometheus registry and update the max."""
+    global _vllm_max_requests_waiting
+    try:
+        for metric in REGISTRY.collect():
+            if metric.name in _VLLM_WAITING_NAMES:
+                for sample in metric.samples:
+                    with _vllm_waiting_lock:
+                        if sample.value > _vllm_max_requests_waiting:
+                            _vllm_max_requests_waiting = sample.value
+                return
+    except Exception:
+        pass
 
 
 async def _wait_for_sidecar_model(config: EngineConfig) -> str:
@@ -244,6 +266,7 @@ async def generate(request: InferenceRequest):
     if _collector:
         _collector.inc_queue_depth()
     metrics.engine_pending_requests.labels(model=model_id).inc()
+    _sample_vllm_waiting()
 
     try:
         start_time = time.time()
@@ -299,6 +322,7 @@ async def generate(request: InferenceRequest):
             detail=f"Generation failed: {str(e)}",
         )
     finally:
+        _sample_vllm_waiting()
         if _collector:
             _collector.dec_queue_depth()
         metrics.engine_pending_requests.labels(model=model_id).dec()
@@ -380,24 +404,55 @@ async def metrics_summary():
         power = gpu_summary.get("current", {}).get("power_watts", 0.0)
         summary["gpu"]["tokens_per_watt"] = round(output_tps / power, 4) if power > 0 else 0.0
 
-    # Read vLLM prefix cache metrics from Prometheus registry.
-    # vLLM registers gauges like "vllm:gpu_prefix_cache_hit_rate";
+    # Override queue stats with vLLM's engine-level view.
+    _sample_vllm_waiting()
+    vllm_waiting_now = None
+    try:
+        for metric in REGISTRY.collect():
+            if metric.name in _VLLM_WAITING_NAMES:
+                for sample in metric.samples:
+                    vllm_waiting_now = sample.value
+                break
+    except Exception:
+        pass
+    with _vllm_waiting_lock:
+        max_waiting = _vllm_max_requests_waiting
+    summary["queue"]["current_depth"] = int(vllm_waiting_now) if vllm_waiting_now is not None else summary["queue"]["current_depth"]
+    summary["queue"]["max_depth"] = int(max_waiting)
+
+    # Read vLLM prefix-cache counter and our own input-token histogram
+    # from the shared Prometheus registry to compute an approximate hit rate.
+    # vLLM exposes "vllm:prefix_cache_hits_total" (cached token count);
     # prometheus_client normalises colons to underscores in metric.name.
-    vllm_cache = {}
-    _VLLM_CACHE_METRICS = {
-        "vllm:gpu_prefix_cache_hit_rate": "hit_rate",
-        "vllm:gpu_cache_usage_perc": "gpu_cache_usage_perc",
-    }
+    prefix_cache_hits = None
+    total_input_tokens = None
+    gpu_cache_usage = None
+    _PREFIX_HITS = {"vllm:prefix_cache_hits_total", "vllm_prefix_cache_hits_total"}
+    _GPU_CACHE = {"vllm:gpu_cache_usage_perc", "vllm_gpu_cache_usage_perc"}
     try:
         for metric in REGISTRY.collect():
             name = metric.name
-            # Check both colon and underscore forms
-            for vllm_name, key in _VLLM_CACHE_METRICS.items():
-                if name == vllm_name or name == vllm_name.replace(":", "_"):
-                    for sample in metric.samples:
-                        vllm_cache[key] = sample.value
+            if name in _PREFIX_HITS or f"{name}_total" in _PREFIX_HITS:
+                for sample in metric.samples:
+                    if sample.name.endswith("_total"):
+                        prefix_cache_hits = sample.value
+            elif name in _GPU_CACHE:
+                for sample in metric.samples:
+                    gpu_cache_usage = sample.value
+            elif name == "engine_input_tokens_per_request":
+                for sample in metric.samples:
+                    if sample.name.endswith("_sum"):
+                        total_input_tokens = sample.value
     except Exception as e:
         logger.warning(f"Failed to read vLLM cache metrics: {e}")
+
+    vllm_cache = {}
+    if prefix_cache_hits is not None:
+        vllm_cache["prefix_cache_hits_tokens"] = prefix_cache_hits
+        if total_input_tokens and total_input_tokens > 0:
+            vllm_cache["hit_rate"] = round(prefix_cache_hits / total_input_tokens, 4)
+    if gpu_cache_usage is not None:
+        vllm_cache["gpu_cache_usage_perc"] = gpu_cache_usage
     if vllm_cache:
         summary.setdefault("kv_cache", {}).update(vllm_cache)
 

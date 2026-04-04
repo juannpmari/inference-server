@@ -81,6 +81,23 @@ class RealisticDispatcher(BaseDispatcher):
 
         return records
 
+    async def warmup_timed(self, duration_seconds: float) -> None:
+        """Run Poisson traffic for *duration_seconds*, discarding all results.
+
+        Uses the same dispatch loop as :meth:`run` so that warmup traffic
+        mirrors the measurement phase (Poisson arrivals, random prompt
+        selection).
+        """
+        rng = random.Random(self.seed)
+        tasks: list[asyncio.Task] = []
+        start = time.monotonic()
+        sent = await self._dispatch_loop(tasks, start, rng, duration=int(duration_seconds))
+        await self._drain_inflight(tasks, self.drain_timeout_seconds)
+        logger.info(
+            "Timed warmup complete: sent %d requests over %.1fs",
+            sent, time.monotonic() - start,
+        )
+
     # ------------------------------------------------------------------
     # Dispatch loop
     # ------------------------------------------------------------------
@@ -90,14 +107,17 @@ class RealisticDispatcher(BaseDispatcher):
         tasks: list[asyncio.Task],
         start_time: float,
         rng: random.Random,
+        *,
+        duration: int | None = None,
     ) -> int:
         """Inner loop: sleep for an exponentially-distributed interval,
         pick a random prompt, and fire the request.  Returns count sent.
         """
+        effective_duration = duration if duration is not None else self.duration_seconds
         sent = 0
         while True:
             elapsed = time.monotonic() - start_time
-            remaining = self.duration_seconds - elapsed
+            remaining = effective_duration - elapsed
             if remaining <= 0:
                 break
 
@@ -108,8 +128,6 @@ class RealisticDispatcher(BaseDispatcher):
             await asyncio.sleep(sleep_time)
 
             prompt = rng.choice(self.prompts)
-            prompt = prompt.with_max_tokens(rng.choice([32, 64]))
-
             task = asyncio.create_task(self.client.send_request(prompt))
             tasks.append(task)
             sent += 1

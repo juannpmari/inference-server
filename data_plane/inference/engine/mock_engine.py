@@ -165,10 +165,19 @@ class MockLLMEngine:
         response_text = self._generate_mock_response(prompt)
         input_tokens = len(self.tokenize(prompt))
 
+        timing = TimingInfo(
+            request_id=str(self.request_counter),
+            submitted_at=time.time(),
+            input_tokens=input_tokens,
+        )
+
         async def _produce():
             words = response_text.split(" ")
             for i, word in enumerate(words):
                 token = word if i == 0 else " " + word
+                if timing.first_token_at == 0.0 and i == 0:
+                    timing.processing_started_at = time.time()
+                    timing.first_token_at = time.time()
                 await queue.put({"token": token, "finish_reason": None})
                 await asyncio.sleep(0.001)
             await queue.put({
@@ -178,6 +187,16 @@ class MockLLMEngine:
                 "completion_tokens": len(words),
             })
             await queue.put(None)
+
+            # Record timing for streaming requests
+            timing.last_step_at = time.time()
+            timing.finished_at = time.time()
+            timing.step_count = len(words)
+            timing.output_tokens = len(words)
+            model = self.config.model_name if self.config else "mock"
+            record = RequestRecord.from_timing(timing.request_id, model, timing)
+            if self.collector:
+                self.collector.record_request(record)
 
         asyncio.create_task(_produce())
         return queue
