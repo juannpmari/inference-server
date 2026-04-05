@@ -20,6 +20,7 @@ RUN uv sync --no-dev --extra gateway
 # Copy application code and config
 COPY server_config.yaml ./
 COPY shared/ ./shared/
+COPY data_plane/__init__.py ./data_plane/
 COPY data_plane/gateway/ ./data_plane/gateway/
 
 EXPOSE 8000

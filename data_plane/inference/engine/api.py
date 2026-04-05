@@ -1,11 +1,21 @@
 import asyncio
 import logging
+import multiprocessing
 import threading
+import urllib.parse
 from contextlib import asynccontextmanager
 from typing import Optional
 from uuid import uuid4
 
+# Must be set before anything touches CUDA (preflight, GPUMonitor, etc.)
+# so that vLLM can fork worker subprocesses without CUDA re-init errors.
+try:
+    multiprocessing.set_start_method("spawn")
+except RuntimeError:
+    pass  # already set
+
 import httpx
+import psutil
 from fastapi import FastAPI, HTTPException, status
 from fastapi.responses import JSONResponse, Response, StreamingResponse
 from pydantic import BaseModel, Field
@@ -14,11 +24,15 @@ import time
 
 from data_plane.inference.engine.config import EngineConfig
 from data_plane.inference.engine import metrics
+from shared.errors import ErrorCode, InferenceServerError
+from shared.logging_config import configure_logging
+from shared.middleware import RequestIDMiddleware, register_error_handlers
 from shared.monitoring import SessionCollector, TimingInfo, RequestRecord
+from shared.preflight import PreflightCheck, run_preflight
+from shared.tracing import init_tracing, instrument_app
 from shared.monitoring.gpu import GPUMonitor
 from shared.monitoring.storage import LocalJSONLStore, BackgroundFlusher
 
-logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s [%(name)s] %(message)s")
 logger = logging.getLogger(__name__)
 
 
@@ -52,6 +66,7 @@ _config = None
 _collector: Optional[SessionCollector] = None
 _gpu_monitor: Optional[GPUMonitor] = None
 _flusher: Optional[BackgroundFlusher] = None
+_draining: bool = False
 
 # Track high-water mark of vLLM's internal num_requests_waiting gauge.
 _vllm_waiting_lock = threading.Lock()
@@ -76,9 +91,15 @@ def _sample_vllm_waiting() -> None:
 
 
 async def _wait_for_sidecar_model(config: EngineConfig) -> str:
-    """Poll the sidecar registry until the model is loaded, then return its local_path."""
+    """Poll the sidecar registry until the model is loaded, then return its local_path.
+
+    Uses exponential backoff starting at ``config.sidecar_poll_interval``,
+    doubling each iteration up to a 30 s cap. Resets delay on a successful
+    (non-loaded) response so we poll more aggressively once the sidecar is up.
+    """
     url = f"{config.sidecar_url}/registry/models"
     deadline = time.monotonic() + config.sidecar_timeout
+    delay = config.sidecar_poll_interval
     logger.info(f"Waiting for sidecar to finish loading model '{config.model_name}'...")
 
     async with httpx.AsyncClient() as client:
@@ -96,14 +117,18 @@ async def _wait_for_sidecar_model(config: EngineConfig) -> str:
                     logger.info(f"Model found but status='{entry.get('status')}', waiting...")
                 else:
                     logger.info("Model not yet in sidecar registry, waiting...")
+                # Successful response — reset delay
+                delay = config.sidecar_poll_interval
             except httpx.RequestError as e:
                 logger.info(f"Sidecar not reachable yet ({e}), waiting...")
+                # Exponential backoff on connection failures, cap at 30s
+                delay = min(delay * 2, 30.0)
 
             if time.monotonic() >= deadline:
                 raise TimeoutError(
                     f"Sidecar did not load model '{config.model_name}' within {config.sidecar_timeout}s"
                 )
-            await asyncio.sleep(config.sidecar_poll_interval)
+            await asyncio.sleep(delay)
 
 
 async def _init_engine(config: EngineConfig):
@@ -140,6 +165,54 @@ async def lifespan(app: FastAPI):
     logger.info("Starting engine...")
     global _init_task, _config, _collector, _gpu_monitor, _flusher
     _config = EngineConfig()
+
+    # --- Pre-flight checks ---
+    preflight_checks = []
+
+    if not _config.enable_engine_mock:
+        async def _gpu_available():
+            import torch
+            return await asyncio.to_thread(torch.cuda.is_available)
+
+        preflight_checks.append(PreflightCheck(
+            name="GPU available",
+            check=_gpu_available,
+            critical=True,
+            message="No GPU detected",
+        ))
+
+    async def _sidecar_url_valid():
+        parsed = urllib.parse.urlparse(_config.sidecar_url)
+        return bool(parsed.scheme and parsed.netloc)
+
+    preflight_checks.append(PreflightCheck(
+        name="Sidecar URL format",
+        check=_sidecar_url_valid,
+        critical=True,
+        message="Invalid sidecar URL",
+    ))
+
+    async def _memory_check():
+        mem = psutil.virtual_memory()
+        return mem.available > 4 * 1024**3
+
+    preflight_checks.append(PreflightCheck(
+        name="System memory > 4 GB",
+        check=_memory_check,
+        critical=False,
+        message="Less than 4 GB free memory",
+    ))
+
+    await run_preflight(preflight_checks, "engine")
+
+    init_tracing("engine", _config.otlp_endpoint)
+    instrument_app(app)
+
+    configure_logging(
+        "engine",
+        level=_config.log_level,
+        json_output=_config.log_json,
+    )
 
     # Initialize monitoring
     def _lora_state():
@@ -179,9 +252,13 @@ async def lifespan(app: FastAPI):
 
     yield
 
-    # Shutdown
+    # Shutdown — graceful drain
     try:
-        logger.info("Shutting down engine...")
+        global _draining
+        _draining = True
+        metrics.engine_draining.set(1)
+        logger.info("Drain started, rejecting new requests")
+
         if _flusher:
             await _flusher.stop()
         if _gpu_monitor:
@@ -192,6 +269,21 @@ async def lifespan(app: FastAPI):
                 await _init_task
             except asyncio.CancelledError:
                 pass
+
+        # Wait for in-flight requests to complete (batching loop stays alive)
+        if _engine is not None:
+            deadline = asyncio.get_event_loop().time() + _config.drain_timeout
+            while _engine.in_flight_count > 0:
+                remaining = _engine.in_flight_count
+                logger.info(f"Draining: {remaining} in-flight requests remaining")
+                if asyncio.get_event_loop().time() >= deadline:
+                    logger.warning(f"Drain timeout: {remaining} requests forcibly cancelled")
+                    break
+                await asyncio.sleep(0.1)
+            else:
+                logger.info("Drain complete: all requests finished")
+
+        # Now cancel the batching loop
         if _batching_loop:
             _batching_loop.cancel()
             try:
@@ -204,6 +296,10 @@ async def lifespan(app: FastAPI):
 
 
 app = FastAPI(title="Engine", lifespan=lifespan)
+
+# Wire up middleware and error handlers
+app.add_middleware(RequestIDMiddleware)
+register_error_handlers(app)
 
 
 @app.get("/health", tags=["health"])
@@ -221,6 +317,12 @@ async def health():
 @app.get("/ready", tags=["health"])
 async def ready():
     """Readiness check endpoint"""
+    if _draining:
+        return JSONResponse(
+            status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+            content={"status": "not_ready", "reason": "draining"},
+            headers={"Retry-After": "1"},
+        )
     if _engine is None:
         return JSONResponse(
             status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
@@ -236,29 +338,92 @@ async def ready():
     return {"status": "ready"}
 
 
-def _check_engine_ready():
-    """Raise HTTPException if engine is not ready."""
-    if _engine is None:
-        raise HTTPException(
+@app.get("/healthz", tags=["health"])
+async def healthz():
+    """Liveness probe — always returns 200."""
+    return {"status": "alive"}
+
+
+@app.get("/readyz", tags=["health"])
+async def readyz():
+    """Readiness probe — returns 200 only when engine can accept traffic."""
+    if _draining:
+        return JSONResponse(
             status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
-            detail="Engine not initialized"
+            content={"status": "not_ready", "reason": "draining"},
+            headers={"Retry-After": "1"},
+        )
+    if _engine is None:
+        return JSONResponse(
+            status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+            content={"status": "not_ready", "reason": "engine_not_initialized"},
         )
     if not _engine.is_ready():
-        raise HTTPException(
+        return JSONResponse(
             status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
-            detail="Model not ready"
+            content={"status": "not_ready", "reason": "model_loading"},
+        )
+    queue_size = len(_engine.request_futures) + len(getattr(_engine, "request_queues", {}))
+    if queue_size >= _config.max_pending:
+        return JSONResponse(
+            status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+            content={"status": "not_ready", "reason": "queue_full"},
+        )
+    return {"status": "ready"}
+
+
+@app.get("/startupz", tags=["health"])
+async def startupz():
+    """Startup probe — returns 200 only after engine is initialized."""
+    if _init_task is not None and not _init_task.done():
+        return JSONResponse(
+            status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+            content={"status": "starting"},
+        )
+    if _engine is None:
+        return JSONResponse(
+            status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+            content={"status": "starting"},
+        )
+    return {"status": "started"}
+
+
+def _check_engine_ready():
+    """Raise InferenceServerError if engine is not ready."""
+    if _draining:
+        raise InferenceServerError(
+            ErrorCode.ENGINE_NOT_READY,
+            "Shutting down",
+            headers={"Retry-After": "1"},
+        )
+    if _engine is None:
+        raise InferenceServerError(
+            ErrorCode.ENGINE_NOT_READY,
+            "Engine not initialized",
+        )
+    if not _engine.is_ready():
+        raise InferenceServerError(
+            ErrorCode.ENGINE_NOT_READY,
+            "Model not ready",
         )
     if len(_engine.request_futures) + len(getattr(_engine, "request_queues", {})) >= _config.max_pending:
-        raise HTTPException(
-            status_code=status.HTTP_429_TOO_MANY_REQUESTS,
-            detail="Queue full, too many pending requests",
+        raise InferenceServerError(
+            ErrorCode.QUEUE_FULL,
+            "Queue full, too many pending requests",
             headers={"Retry-After": "1"},
         )
 
 
 @app.post("/generate", response_model=InferenceResponse, tags=["inference"])
 async def generate(request: InferenceRequest):
-    """Generate text from a prompt (internal endpoint called by gateway)."""
+    """Generate text from a prompt (internal endpoint called by gateway).
+
+    Timeout hierarchy (outermost -> innermost):
+      gateway.request_timeout  >  engine.sidecar_timeout  >  engine.inference_timeout
+    The ``asyncio.wait_for`` below uses ``inference_timeout`` which must be
+    strictly less than the gateway's ``request_timeout`` so the engine can
+    return an error before the gateway times out the upstream connection.
+    """
     _check_engine_ready()
 
     model_id = _config.model_name
@@ -284,7 +449,7 @@ async def generate(request: InferenceRequest):
                 frequency_penalty=request.frequency_penalty,
                 seed=request.seed,
             ),
-            timeout=_config.sidecar_timeout,
+            timeout=_config.inference_timeout,
         )
 
         duration = time.time() - start_time
@@ -310,9 +475,9 @@ async def generate(request: InferenceRequest):
 
     except asyncio.TimeoutError:
         metrics.engine_requests_total.labels(model=model_id, status="timeout").inc()
-        raise HTTPException(
-            status_code=status.HTTP_504_GATEWAY_TIMEOUT,
-            detail="Request generation timed out",
+        raise InferenceServerError(
+            ErrorCode.INFERENCE_TIMEOUT,
+            "Request generation timed out",
         )
     except Exception as e:
         logger.error(f"Inference error: {e}")

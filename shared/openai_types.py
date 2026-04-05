@@ -13,20 +13,20 @@ from pydantic import BaseModel, Field
 
 class ChatMessage(BaseModel):
     role: Literal["system", "user", "assistant", "tool"]
-    content: Optional[str] = None
+    content: Optional[str] = Field(default=None, max_length=128_000)
     name: Optional[str] = None
     tool_calls: Optional[list[dict[str, Any]]] = None
 
 
 class ChatCompletionRequest(BaseModel):
     model: str
-    messages: list[ChatMessage]
+    messages: list[ChatMessage] = Field(..., min_length=1, max_length=256)
     temperature: Optional[float] = Field(default=1.0, ge=0.0, le=2.0)
     top_p: Optional[float] = Field(default=1.0, ge=0.0, le=1.0)
     n: int = 1
     stream: bool = False
     stop: Optional[list[str]] = None
-    max_tokens: Optional[int] = None
+    max_tokens: Optional[int] = Field(default=None, ge=1, le=16_384)
     presence_penalty: float = Field(default=0.0, ge=-2.0, le=2.0)
     frequency_penalty: float = Field(default=0.0, ge=-2.0, le=2.0)
     logit_bias: Optional[dict[str, float]] = None
@@ -40,13 +40,13 @@ class ChatCompletionRequest(BaseModel):
 
 class CompletionRequest(BaseModel):
     model: str
-    prompt: str
+    prompt: str = Field(..., min_length=1, max_length=128_000)
     temperature: Optional[float] = Field(default=1.0, ge=0.0, le=2.0)
     top_p: Optional[float] = Field(default=1.0, ge=0.0, le=1.0)
     n: int = 1
     stream: bool = False
     stop: Optional[list[str]] = None
-    max_tokens: Optional[int] = None
+    max_tokens: Optional[int] = Field(default=None, ge=1, le=16_384)
     presence_penalty: float = Field(default=0.0, ge=-2.0, le=2.0)
     frequency_penalty: float = Field(default=0.0, ge=-2.0, le=2.0)
     seed: Optional[int] = None

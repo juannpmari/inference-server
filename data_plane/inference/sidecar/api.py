@@ -1,5 +1,9 @@
 import asyncio
 import logging
+import os
+import shutil
+import socket
+import tempfile
 import time
 from contextlib import asynccontextmanager
 from typing import Optional
@@ -12,8 +16,12 @@ from data_plane.inference.sidecar import metrics
 from data_plane.inference.sidecar.artifact_manager import ArtifactManager
 from data_plane.inference.sidecar.config import SidecarConfig
 from data_plane.inference.sidecar.kv_block_registry import KVBlockRegistry
+from shared.errors import ErrorCode, InferenceServerError
+from shared.preflight import PreflightCheck, run_preflight
+from shared.tracing import init_tracing, instrument_app
+from shared.logging_config import configure_logging
+from shared.middleware import RequestIDMiddleware, register_error_handlers
 
-logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s [%(name)s] %(message)s")
 logger = logging.getLogger(__name__)
 
 # Global state
@@ -29,6 +37,81 @@ async def lifespan(app: FastAPI):
     logger.info("Starting sidecar...")
 
     _config = SidecarConfig()
+
+    init_tracing("sidecar", _config.otlp_endpoint)
+    instrument_app(app)
+
+    configure_logging(
+        "sidecar",
+        level=_config.log_level,
+        json_output=_config.log_json,
+    )
+
+    # --- Pre-flight checks ---
+    preflight_checks = []
+
+    async def _shared_volume_writable():
+        def _try_write():
+            f = tempfile.NamedTemporaryFile(dir=_config.shared_volume, delete=True)
+            f.close()
+            return True
+        return await asyncio.to_thread(_try_write)
+
+    preflight_checks.append(PreflightCheck(
+        name="Shared volume writable",
+        check=_shared_volume_writable,
+        critical=True,
+        message="Shared volume not writable",
+    ))
+
+    async def _disk_space_check():
+        usage = shutil.disk_usage(_config.shared_volume)
+        return usage.free > 2 * 1024**3
+
+    preflight_checks.append(PreflightCheck(
+        name="Disk space > 2 GB",
+        check=_disk_space_check,
+        critical=True,
+        message="Less than 2 GB disk space on shared volume",
+    ))
+
+    if _config.l2_redis_host != "localhost":
+        async def _redis_reachable():
+            def _try_connect():
+                s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+                s.settimeout(2.0)
+                try:
+                    s.connect((_config.l2_redis_host, _config.l2_redis_port))
+                    return True
+                except (socket.timeout, ConnectionRefusedError, OSError):
+                    return False
+                finally:
+                    s.close()
+            return await asyncio.to_thread(_try_connect)
+
+        preflight_checks.append(PreflightCheck(
+            name="L2 Redis reachable",
+            check=_redis_reachable,
+            critical=False,
+            message="L2 Redis unreachable",
+        ))
+
+    async def _hf_token_set():
+        if os.environ.get("HF_TOKEN"):
+            return True
+        if _config.hf_token_file and os.path.exists(_config.hf_token_file):
+            return True
+        return False
+
+    preflight_checks.append(PreflightCheck(
+        name="HF_TOKEN set",
+        check=_hf_token_set,
+        critical=False,
+        message="HF_TOKEN not set — private model downloads will fail",
+    ))
+
+    await run_preflight(preflight_checks, "sidecar")
+
     _manager = ArtifactManager(config=_config)
     _kv_registry = KVBlockRegistry()
     _kv_registry._l1_capacity_bytes = _config.l1_num_blocks * _config.l1_block_size_bytes
@@ -79,6 +162,10 @@ async def lifespan(app: FastAPI):
 
 app = FastAPI(title="Sidecar", lifespan=lifespan)
 
+# Wire up middleware and error handlers
+app.add_middleware(RequestIDMiddleware)
+register_error_handlers(app)
+
 
 @app.get("/health", tags=["health"])
 async def health_check():
@@ -95,9 +182,9 @@ async def health_check():
 async def readiness_check():
     """Readiness probe — only ready when initial model is loaded."""
     if _manager is None or not _manager.is_ready:
-        raise HTTPException(
-            status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
-            detail="Artifact Manager loading initial model.",
+        raise InferenceServerError(
+            ErrorCode.SIDECAR_NOT_READY,
+            "Artifact Manager loading initial model.",
         )
     return {
         "status": "ready",
@@ -105,11 +192,39 @@ async def readiness_check():
     }
 
 
+@app.get("/healthz", tags=["health"])
+async def healthz():
+    """Liveness probe — always returns 200."""
+    return {"status": "alive"}
+
+
+@app.get("/readyz", tags=["health"])
+async def readyz():
+    """Readiness probe — returns 200 only when initial model is loaded."""
+    if _manager is None or not _manager.is_ready:
+        return JSONResponse(
+            status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+            content={"status": "not_ready", "reason": "model_loading"},
+        )
+    return {"status": "ready"}
+
+
+@app.get("/startupz", tags=["health"])
+async def startupz():
+    """Startup probe — returns 200 once initial model is loaded."""
+    if _manager is None or not _manager.is_ready:
+        return JSONResponse(
+            status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+            content={"status": "starting"},
+        )
+    return {"status": "started"}
+
+
 @app.post("/load/{model_identifier:path}", tags=["models"])
 async def load_model_route(model_identifier: str, version: str = "latest"):
     """Accept a model load request and process it in the background."""
     if _manager is None:
-        raise HTTPException(status_code=status.HTTP_503_SERVICE_UNAVAILABLE, detail="Sidecar not initialized")
+        raise InferenceServerError(ErrorCode.SIDECAR_NOT_READY, "Sidecar not initialized")
 
     # Already loaded — return immediately
     existing = _manager.model_registry.get(model_identifier)
@@ -156,7 +271,7 @@ async def load_model_route(model_identifier: str, version: str = "latest"):
 async def unload_model_route(model_identifier: str):
     """Remove a model from the registry."""
     if _manager is None:
-        raise HTTPException(status_code=status.HTTP_503_SERVICE_UNAVAILABLE, detail="Sidecar not initialized")
+        raise InferenceServerError(ErrorCode.SIDECAR_NOT_READY, "Sidecar not initialized")
 
     if model_identifier not in _manager.model_registry:
         raise HTTPException(
@@ -164,7 +279,7 @@ async def unload_model_route(model_identifier: str):
             detail=f"Model {model_identifier} not resident.",
         )
 
-    _manager.unload_model(model_identifier)
+    await _manager.unload_model(model_identifier)
     metrics.sidecar_resident_models.set(len(_manager.model_registry))
     return {"status": "success", "model_identifier": model_identifier}
 
@@ -174,14 +289,39 @@ async def get_models():
     """Returns the current resident models."""
     if _manager is None:
         return []
-    return _manager.model_registry
+    result = {}
+    for model_id, entry in _manager.model_registry.items():
+        info = dict(entry)
+        if info.get("status") == "downloading" and model_id in _manager.download_progress:
+            info["download_progress"] = _manager.download_progress[model_id]
+        result[model_id] = info
+    return result
+
+
+@app.get("/status/{model_identifier:path}", tags=["models"])
+async def get_model_status(model_identifier: str):
+    """Return the status of a specific model, including download progress if applicable."""
+    if _manager is None:
+        raise HTTPException(status_code=status.HTTP_503_SERVICE_UNAVAILABLE, detail="Sidecar not initialized")
+
+    entry = _manager.model_registry.get(model_identifier)
+    if entry is None:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail=f"Model {model_identifier} not found in registry.",
+        )
+
+    info = dict(entry)
+    if info.get("status") == "downloading" and model_identifier in _manager.download_progress:
+        info["download_progress"] = _manager.download_progress[model_identifier]
+    return info
 
 
 @app.post("/adapter/unload/{adapter_identifier:path}", tags=["adapters"])
 async def unload_adapter_route(adapter_identifier: str):
     """Remove an adapter from the registry."""
     if _manager is None:
-        raise HTTPException(status_code=status.HTTP_503_SERVICE_UNAVAILABLE, detail="Sidecar not initialized")
+        raise InferenceServerError(ErrorCode.SIDECAR_NOT_READY, "Sidecar not initialized")
 
     if adapter_identifier not in _manager.adapter_registry:
         raise HTTPException(
@@ -189,7 +329,7 @@ async def unload_adapter_route(adapter_identifier: str):
             detail=f"Adapter {adapter_identifier} not resident.",
         )
 
-    _manager.unload_adapter(adapter_identifier)
+    await _manager.unload_adapter(adapter_identifier)
     metrics.sidecar_resident_adapters.set(len(_manager.adapter_registry))
     return {"status": "success", "adapter_identifier": adapter_identifier}
 
@@ -209,7 +349,7 @@ async def load_adapter_route(adapter_identifier: str, version: str = "latest"):
     Poll GET /registry/adapters to check when status becomes "loaded".
     """
     if _manager is None:
-        raise HTTPException(status_code=status.HTTP_503_SERVICE_UNAVAILABLE, detail="Sidecar not initialized")
+        raise InferenceServerError(ErrorCode.SIDECAR_NOT_READY, "Sidecar not initialized")
 
     # Already loaded — return immediately
     existing = _manager.adapter_registry.get(adapter_identifier)

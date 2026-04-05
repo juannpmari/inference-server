@@ -19,16 +19,17 @@ RUN touch README.md
 # Install production dependencies (cached unless pyproject.toml/uv.lock change)
 RUN uv sync --no-dev --extra sidecar
 
-# Copy protobuf definitions and compile (cached unless proto files change)
-COPY shared/proto/ ./shared/proto/
+# Copy application code and config (changes here don't invalidate layers above)
+COPY shared/ ./shared/
+
+# Compile protobuf definitions
 RUN uv run python -m grpc_tools.protoc -I shared/proto \
     --python_out=shared/proto --pyi_out=shared/proto \
     --grpc_python_out=shared/proto shared/proto/kv_cache.proto && \
     sed -i 's/^import kv_cache_pb2/from shared.proto import kv_cache_pb2/' shared/proto/kv_cache_pb2_grpc.py
-
-# Copy application code and config (changes here don't invalidate layers above)
-COPY shared/ ./shared/
-COPY data_plane/ ./data_plane/
+COPY data_plane/__init__.py ./data_plane/
+COPY data_plane/inference/__init__.py ./data_plane/inference/
+COPY data_plane/inference/sidecar/ ./data_plane/inference/sidecar/
 COPY server_config.yaml ./
 
 EXPOSE 8001 50051

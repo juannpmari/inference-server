@@ -20,30 +20,19 @@ from shared.monitoring.models import TimingInfo, RequestRecord
 logger = logging.getLogger(__name__)
 
 class Engine:
-    def __init__(self, config, model_path: str = None, collector=None):
-        if not VLLM_AVAILABLE:
-            raise RuntimeError(
-                "vLLM is not installed. Install with: pip install vllm\n"
-                "Or use ENABLE_ENGINE_MOCK=true to use the mock engine."
-            )
 
-        self.config = config
-        self.request_counter = 0
-        self.request_futures: Dict[str, asyncio.Future] = {}
-        self.request_queues: Dict[str, asyncio.Queue] = {}
-        self.request_prev_text: Dict[str, str] = {}
-        self.request_timings: Dict[str, TimingInfo] = {}
-        self.collector = collector
+    @staticmethod
+    def _build_cli_args(config, model_path: str = None) -> list[str]:
+        """Build the CLI argument list for vLLM EngineArgs.
 
-        parser = FlexibleArgumentParser()
-        parser = EngineArgs.add_cli_args(parser)
-
+        Extracted as a static method so it can be unit-tested without a GPU.
+        """
         resolved_model = model_path or config.model_name
         cli_args_list = [
             "--model", resolved_model,
             "--dtype", config.dtype,
             "--gpu-memory-utilization", str(config.gpu_memory_utilization),
-            "--max-model-len", str(config.max_model_len)
+            "--max-model-len", str(config.max_model_len),
         ]
 
         if config.enable_lora:
@@ -70,12 +59,34 @@ class Engine:
                 }),
             ])
 
+        return cli_args_list
+
+    def __init__(self, config, model_path: str = None, collector=None):
+        if not VLLM_AVAILABLE:
+            raise RuntimeError(
+                "vLLM is not installed. Install with: pip install vllm\n"
+                "Or use ENABLE_ENGINE_MOCK=true to use the mock engine."
+            )
+
+        self.config = config
+        self.request_counter = 0
+        self.request_futures: Dict[str, asyncio.Future] = {}
+        self.request_queues: Dict[str, asyncio.Queue] = {}
+        self.request_prev_text: Dict[str, str] = {}
+        self.request_timings: Dict[str, TimingInfo] = {}
+        self.collector = collector
+
+        parser = FlexibleArgumentParser()
+        parser = EngineArgs.add_cli_args(parser)
+
+        cli_args_list = self._build_cli_args(config, model_path)
+
         args = parser.parse_args(cli_args_list)
         engine_args = EngineArgs.from_cli_args(args)
         self.sampling_params = SamplingParams(temperature=config.temperature)
 
         self.engine = LLMEngine.from_engine_args(engine_args)
-        logger.info(f"Engine initialized with model {resolved_model}")
+        logger.info(f"Engine initialized with model {model_path or config.model_name}")
 
         self.lora_manager = None
         if config.enable_lora:
@@ -253,6 +264,11 @@ class Engine:
                 parts.append(f"{role}: {content}")
             parts.append("assistant:")
             return "\n".join(parts)
+
+    @property
+    def in_flight_count(self) -> int:
+        """Number of requests currently being processed."""
+        return len(self.request_futures) + len(self.request_queues)
 
     def is_ready(self) -> bool:
         """Check if engine is ready to process requests"""

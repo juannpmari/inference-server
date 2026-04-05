@@ -18,6 +18,7 @@ from typing import Dict, NamedTuple, Optional
 import httpx
 
 from data_plane.inference.engine import metrics
+from shared.resilience import retry_with_backoff
 
 logger = logging.getLogger(__name__)
 
@@ -132,10 +133,19 @@ class LoRAManager:
         """Trigger sidecar download, poll until ready, evict if needed, load to GPU."""
 
         async with httpx.AsyncClient(timeout=30.0) as client:
-            # 1. Trigger download (fire-and-forget, returns 202 or 200 if cached)
-            resp = await client.post(
-                f"{self._sidecar_url}/adapter/load/{identifier}",
-                params={"version": version},
+            # 1. Trigger download (fire-and-forget, returns 202 or 200 if cached).
+            #    Wrapped in retry_with_backoff to tolerate transient sidecar errors.
+            async def _trigger_download():
+                r = await client.post(
+                    f"{self._sidecar_url}/adapter/load/{identifier}",
+                    params={"version": version},
+                )
+                r.raise_for_status()
+                return r
+
+            resp = await retry_with_backoff(
+                _trigger_download,
+                retryable_exceptions=(httpx.ConnectError, httpx.TimeoutException),
             )
             resp.raise_for_status()
 
@@ -185,12 +195,16 @@ class LoRAManager:
     async def _poll_adapter_ready(
         self, client: httpx.AsyncClient, identifier: str, version: str
     ) -> str:
-        """Poll GET /registry/adapters until adapter status is 'loaded'. Returns local_path."""
+        """Poll GET /registry/adapters until adapter status is 'loaded'. Returns local_path.
+
+        Uses exponential backoff starting at ``_poll_interval``, doubling up to 30 s.
+        """
         url = f"{self._sidecar_url}/registry/adapters"
         deadline = time.monotonic() + self._poll_timeout
+        delay = self._poll_interval
 
         while True:
-            await asyncio.sleep(self._poll_interval)
+            await asyncio.sleep(delay)
 
             try:
                 resp = await client.get(url, timeout=5.0)
@@ -216,8 +230,11 @@ class LoRAManager:
                 logger.debug(
                     f"Adapter {identifier} status='{entry.get('status')}', polling..."
                 )
+                # Successful poll but not yet loaded — keep current delay
             except httpx.RequestError as e:
                 logger.warning(f"Sidecar poll failed ({e}), retrying...")
+                # Exponential backoff on connection failures, cap at 30s
+                delay = min(delay * 2, 30.0)
 
             if time.monotonic() >= deadline:
                 raise TimeoutError(
