@@ -302,42 +302,6 @@ app.add_middleware(RequestIDMiddleware)
 register_error_handlers(app)
 
 
-@app.get("/health", tags=["health"])
-async def health():
-    """Health check endpoint"""
-    if _engine is None:
-        logger.info(f"Health check: _engine is None, _init_task done={_init_task.done() if _init_task else 'no task'}, _init_task exception={_init_task.exception() if _init_task and _init_task.done() else 'N/A'}")
-        return JSONResponse(
-            status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
-            content={"status": "initializing"}
-        )
-    return {"status": "healthy"}
-
-
-@app.get("/ready", tags=["health"])
-async def ready():
-    """Readiness check endpoint"""
-    if _draining:
-        return JSONResponse(
-            status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
-            content={"status": "not_ready", "reason": "draining"},
-            headers={"Retry-After": "1"},
-        )
-    if _engine is None:
-        return JSONResponse(
-            status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
-            content={"status": "not_ready", "reason": "engine_not_initialized"}
-        )
-
-    if not _engine.is_ready():
-        return JSONResponse(
-            status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
-            content={"status": "not_ready", "reason": "model_loading"}
-        )
-
-    return {"status": "ready"}
-
-
 @app.get("/healthz", tags=["health"])
 async def healthz():
     """Liveness probe — always returns 200."""

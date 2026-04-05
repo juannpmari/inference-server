@@ -55,20 +55,19 @@ class TestSidecarHealth:
     """Tests for health and readiness endpoints."""
 
     def test_health_returns_ok(self, test_client):
-        response = test_client.get("/health")
+        response = test_client.get("/healthz")
         assert response.status_code == 200
-        assert response.json()["status"] == "ok"
+        assert response.json()["status"] == "alive"
 
     def test_ready_returns_ready_when_loaded(self, test_client):
-        response = test_client.get("/ready")
+        response = test_client.get("/readyz")
         assert response.status_code == 200
         data = response.json()
         assert data["status"] == "ready"
-        assert "test-model" in data["resident_models"]
 
     def test_ready_returns_503_when_not_ready(self, test_client, mock_manager):
         mock_manager.is_ready = False
-        response = test_client.get("/ready")
+        response = test_client.get("/readyz")
         assert response.status_code == 503
 
 

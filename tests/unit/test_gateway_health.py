@@ -1,4 +1,4 @@
-"""Tests for gateway /ready endpoint with engine health cascading."""
+"""Tests for gateway /readyz endpoint with engine health cascading."""
 
 import time
 from unittest.mock import AsyncMock, patch
@@ -30,7 +30,7 @@ class TestReadyEndpoint:
 
     @pytest.mark.asyncio
     async def test_ready_returns_200_when_engine_healthy(self):
-        """When engine /ready returns 200, gateway /ready should return 200."""
+        """When engine /readyz returns 200, gateway /readyz should return 200."""
         # Simulate healthy engine via the cache
         routing._engine_health_cache["healthy"] = True
         routing._engine_health_cache["checked_at"] = time.monotonic()
@@ -38,14 +38,14 @@ class TestReadyEndpoint:
         async with AsyncClient(
             transport=_ASGITransport(routing.app), base_url="http://test"
         ) as client:
-            resp = await client.get("/ready")
+            resp = await client.get("/readyz")
         assert resp.status_code == 200
         data = resp.json()
         assert data["status"] == "ready"
 
     @pytest.mark.asyncio
     async def test_ready_returns_503_when_engine_down(self):
-        """When engine is unreachable, gateway /ready should return 503."""
+        """When engine is unreachable, gateway /readyz should return 503."""
         # Force cache to be stale so it re-checks
         routing._engine_health_cache["checked_at"] = 0.0
 
@@ -60,7 +60,7 @@ class TestReadyEndpoint:
             async with AsyncClient(
                 transport=_ASGITransport(routing.app), base_url="http://test"
             ) as client:
-                resp = await client.get("/ready")
+                resp = await client.get("/readyz")
             assert resp.status_code == 503
             data = resp.json()
             assert data["reason"] == "engine_unreachable"
@@ -82,13 +82,13 @@ class TestReadyEndpoint:
             async with AsyncClient(
                 transport=_ASGITransport(routing.app), base_url="http://test"
             ) as client:
-                resp = await client.get("/ready")
+                resp = await client.get("/readyz")
             # Should still be 200 because cache is fresh
             assert resp.status_code == 200
 
     @pytest.mark.asyncio
     async def test_ready_returns_503_when_draining(self):
-        """When gateway is draining, /ready should return 503."""
+        """When gateway is draining, /readyz should return 503."""
         routing._draining = True
         routing._engine_health_cache["healthy"] = True
         routing._engine_health_cache["checked_at"] = time.monotonic()
@@ -96,7 +96,7 @@ class TestReadyEndpoint:
         async with AsyncClient(
             transport=_ASGITransport(routing.app), base_url="http://test"
         ) as client:
-            resp = await client.get("/ready")
+            resp = await client.get("/readyz")
         assert resp.status_code == 503
         data = resp.json()
         assert data["reason"] == "draining"

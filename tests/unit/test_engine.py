@@ -220,22 +220,22 @@ class TestEngineAPI:
 
     @pytest.mark.asyncio
     async def test_health_endpoint(self):
-        """Test /health endpoint"""
+        """Test /healthz endpoint"""
         from fastapi.testclient import TestClient
 
         client = TestClient(app)
-        response = client.get("/health")
+        response = client.get("/healthz")
 
-        # Should return 200 or 503 depending on engine state
-        assert response.status_code in [200, 503]
+        # Liveness is always 200 if the process is serving HTTP
+        assert response.status_code == 200
 
     @pytest.mark.asyncio
     async def test_ready_endpoint(self):
-        """Test /ready endpoint"""
+        """Test /readyz endpoint"""
         from fastapi.testclient import TestClient
 
         client = TestClient(app)
-        response = client.get("/ready")
+        response = client.get("/readyz")
 
         # Should return 200 or 503 depending on engine state
         assert response.status_code in [200, 503]

@@ -9,7 +9,7 @@ import urllib.parse
 from contextlib import asynccontextmanager
 
 import httpx
-from fastapi import FastAPI, Request
+from fastapi import Depends, FastAPI, Request
 from fastapi.exceptions import HTTPException, RequestValidationError
 from fastapi.responses import JSONResponse, Response, StreamingResponse
 from prometheus_client import generate_latest, REGISTRY
@@ -21,7 +21,12 @@ from shared.errors import ErrorCode, InferenceServerError
 from shared.preflight import PreflightCheck, run_preflight
 from shared.tracing import init_tracing, instrument_app
 from shared.logging_config import configure_logging
-from shared.middleware import RequestIDMiddleware, register_error_handlers, request_id_ctx
+from shared.middleware import (
+    RequestIDMiddleware,
+    RequestSizeLimitMiddleware,
+    register_error_handlers,
+    request_id_ctx,
+)
 from shared.rate_limiter import TokenBucketRateLimiter
 from shared.resilience import CircuitBreaker, CircuitBreakerOpen
 from shared.openai_types import (
@@ -165,80 +170,11 @@ async def lifespan(app: FastAPI):
 app = FastAPI(title="Inference Gateway", lifespan=lifespan)
 
 
-# ---------------------------------------------------------------------------
-# Request size limit middleware (ASGI)
-# ---------------------------------------------------------------------------
-
-_MAX_REQUEST_BODY_BYTES = 1_048_576  # 1 MB
-
-
-class RequestSizeLimitMiddleware:
-    """ASGI middleware that rejects request bodies larger than 1 MB."""
-
-    def __init__(self, app):  # type: ignore[no-untyped-def]
-        self.app = app
-
-    async def __call__(self, scope, receive, send):  # type: ignore[no-untyped-def]
-        if scope["type"] != "http":
-            await self.app(scope, receive, send)
-            return
-
-        body_size = 0
-        body_parts: list[bytes] = []
-        exceeded = False
-
-        async def receive_wrapper():
-            nonlocal body_size, exceeded
-            message = await receive()
-            if message["type"] == "http.request":
-                chunk = message.get("body", b"")
-                body_size += len(chunk)
-                body_parts.append(chunk)
-                if body_size > _MAX_REQUEST_BODY_BYTES:
-                    exceeded = True
-            return message
-
-        # Read the first message to check size
-        first_message = await receive()
-        if first_message["type"] == "http.request":
-            chunk = first_message.get("body", b"")
-            body_size += len(chunk)
-            body_parts.append(chunk)
-            if body_size > _MAX_REQUEST_BODY_BYTES:
-                exceeded = True
-
-        if exceeded:
-            response = JSONResponse(
-                status_code=413,
-                content={
-                    "error": {
-                        "message": "Request body too large (max 1 MB)",
-                        "type": "invalid_request_error",
-                        "param": None,
-                        "code": None,
-                    }
-                },
-            )
-            await response(scope, receive, send)
-            return
-
-        # Replay the first message and forward
-        replay_done = False
-
-        async def replay_receive():
-            nonlocal replay_done
-            if not replay_done:
-                replay_done = True
-                return first_message
-            msg = await receive()
-            return msg
-
-        await self.app(scope, replay_receive, send)
-
-
-# Wire up middleware (order: outermost first)
-app.add_middleware(RequestSizeLimitMiddleware)
+# Wire up middleware. Note: ``add_middleware`` *prepends*, so the LAST one
+# added is the outermost wrapper. We want size-limit to be outermost so
+# oversized requests are rejected before a request ID is allocated.
 app.add_middleware(RequestIDMiddleware)
+app.add_middleware(RequestSizeLimitMiddleware, max_bytes=_config.max_request_body_bytes)
 register_error_handlers(app, openai_compat=True)
 
 
@@ -325,7 +261,7 @@ async def _check_engine_health() -> bool:
     for url in MODEL_SERVICE_MAP.values():
         try:
             async with httpx.AsyncClient(timeout=2.0) as client:
-                resp = await client.get(f"{url}/ready")
+                resp = await client.get(f"{url}/readyz")
                 if resp.status_code == 200:
                     healthy = True
                     break
@@ -335,31 +271,6 @@ async def _check_engine_health() -> bool:
     _engine_health_cache["healthy"] = healthy
     _engine_health_cache["checked_at"] = now
     return healthy
-
-
-@app.get("/health")
-async def health():
-    return {"status": "healthy"}
-
-
-@app.get("/ready")
-async def ready():
-    if _draining:
-        return JSONResponse(
-            status_code=503,
-            content={"status": "not_ready", "reason": "draining"}
-        )
-    engine_ok = await _check_engine_health()
-    if not engine_ok:
-        return JSONResponse(
-            status_code=503,
-            content={
-                "status": "not_ready",
-                "reason": "engine_unreachable",
-                "error_code": ErrorCode.ENGINE_UNREACHABLE.value,
-            },
-        )
-    return {"status": "ready"}
 
 
 @app.get("/healthz")
@@ -380,7 +291,11 @@ async def readyz():
     if not engine_ok:
         return JSONResponse(
             status_code=503,
-            content={"status": "not_ready", "reason": "engines_unreachable"},
+            content={
+                "status": "not_ready",
+                "reason": "engine_unreachable",
+                "error_code": ErrorCode.ENGINE_UNREACHABLE.value,
+            },
         )
     return {"status": "ready"}
 
@@ -515,14 +430,112 @@ def _adapter_kwargs(adapter_identifier=None, adapter_version=None) -> dict:
 
 
 # ---------------------------------------------------------------------------
+# Shared transport helpers
+# ---------------------------------------------------------------------------
+
+async def _run_unary_completion(
+    worker_url: str,
+    engine_payload: dict,
+    model: str,
+    build_response,
+    start_time: float | None = None,
+):
+    """Run a unary (non-streaming) completion against the engine.
+
+    Handles in-flight counting, circuit breaker, ConnectError → 503,
+    metrics (duration + status), and error responses. Delegates the
+    final response shape to ``build_response(data)`` — the only thing
+    that differs between /v1/completions and /v1/chat/completions.
+    """
+    global _in_flight_count
+    if start_time is None:
+        start_time = time.monotonic()
+    _in_flight_count += 1
+    try:
+        http_client: httpx.AsyncClient = app.state.http_client
+        try:
+            resp = await _engine_post(http_client, f"{worker_url}/generate", engine_payload)
+        except httpx.ConnectError:
+            gateway_metrics.gateway_requests_total.labels(model=model, status_code="503").inc()
+            raise InferenceServerError(
+                ErrorCode.ENGINE_UNREACHABLE,
+                f"Model service '{model}' is unreachable.",
+            )
+
+        duration = time.monotonic() - start_time
+        gateway_metrics.gateway_request_duration_seconds.labels(model=model).observe(duration)
+        gateway_metrics.gateway_requests_total.labels(model=model, status_code=str(resp.status_code)).inc()
+
+        if resp.status_code >= 400:
+            raise HTTPException(status_code=resp.status_code, detail=resp.text)
+
+        return build_response(resp.json())
+    finally:
+        _in_flight_count -= 1
+
+
+async def _iter_engine_tokens(worker_url: str, payload: dict):
+    """Yield parsed token events from the engine /generate/stream endpoint.
+
+    Handles the circuit breaker guard, transport errors, mid-stream 5xx
+    responses, and ``[DONE]`` termination. Does NOT format OpenAI SSE
+    chunks — callers own chunk shaping so the subtle differences between
+    completion and chat completion stay readable.
+
+    Yields tagged tuples:
+        ("token", dict)  — a parsed engine token event
+        ("done",  None)  — the engine sent [DONE] (breaker is recorded success)
+        ("error", str)   — transport/CB failure (breaker is already updated)
+    """
+    try:
+        _engine_circuit_breaker.allow()
+    except CircuitBreakerOpen:
+        yield ("error", "Engine circuit breaker open")
+        return
+
+    stream_client: httpx.AsyncClient = app.state.stream_client
+    try:
+        async with stream_client.stream(
+            "POST",
+            f"{worker_url}/generate/stream",
+            json=payload,
+            headers=_request_id_headers(),
+        ) as resp:
+            if resp.status_code >= 500:
+                _engine_circuit_breaker.record_failure()
+                yield ("error", f"Engine returned {resp.status_code}")
+                return
+            async for line in resp.aiter_lines():
+                if not line.startswith("data: "):
+                    continue
+                raw = line[len("data: "):]
+                if raw == "[DONE]":
+                    _engine_circuit_breaker.record_success()
+                    yield ("done", None)
+                    return
+                yield ("token", json.loads(raw))
+    except httpx.ConnectError:
+        _engine_circuit_breaker.record_failure()
+        yield ("error", "Model service unreachable")
+    except (httpx.ReadError, httpx.RemoteProtocolError):
+        _engine_circuit_breaker.record_failure()
+        yield ("error", "Engine stream interrupted")
+
+
+def _sse_error(message: str) -> str:
+    return f"data: {json.dumps({'error': {'message': message, 'type': 'server_error'}})}\n\n"
+
+
+# ---------------------------------------------------------------------------
 # POST /v1/completions
 # ---------------------------------------------------------------------------
 
 @app.post("/v1/completions")
-async def create_completion(request: CompletionRequest):
-    global _in_flight_count
-    _check_gateway_draining()
-    _check_rate_limit()
+async def create_completion(
+    request: CompletionRequest,
+    _drain: None = Depends(_check_gateway_draining),
+    _rate: None = Depends(_check_rate_limit),
+):
     worker_url = _resolve_worker(request.model)
     sampling = _sampling_kwargs(
         temperature=request.temperature, top_p=request.top_p,
@@ -538,28 +551,7 @@ async def create_completion(request: CompletionRequest):
     if request.stream:
         return _stream_completion(worker_url, engine_payload, request.model, completion_id)
 
-    # Non-streaming
-    start_time = time.monotonic()
-    _in_flight_count += 1
-    try:
-        http_client: httpx.AsyncClient = app.state.http_client
-        try:
-            resp = await _engine_post(http_client, f"{worker_url}/generate", engine_payload)
-        except httpx.ConnectError:
-            gateway_metrics.gateway_requests_total.labels(model=request.model, status_code="503").inc()
-            raise InferenceServerError(
-                ErrorCode.ENGINE_UNREACHABLE,
-                f"Model service '{request.model}' is unreachable.",
-            )
-
-        duration = time.monotonic() - start_time
-        gateway_metrics.gateway_request_duration_seconds.labels(model=request.model).observe(duration)
-        gateway_metrics.gateway_requests_total.labels(model=request.model, status_code=str(resp.status_code)).inc()
-
-        if resp.status_code >= 400:
-            raise HTTPException(status_code=resp.status_code, detail=resp.text)
-
-        data = resp.json()
+    def _build(data: dict):
         return CompletionResponse(
             id=completion_id,
             created=now_unix(),
@@ -575,8 +567,8 @@ async def create_completion(request: CompletionRequest):
                 total_tokens=data.get("prompt_tokens", 0) + data.get("tokens_generated", 0),
             ),
         ).model_dump()
-    finally:
-        _in_flight_count -= 1
+
+    return await _run_unary_completion(worker_url, engine_payload, request.model, _build)
 
 
 def _stream_completion(worker_url: str, payload: dict, model: str, completion_id: str):
@@ -588,51 +580,25 @@ def _stream_completion(worker_url: str, payload: dict, model: str, completion_id
         _in_flight_count += 1
         gateway_metrics.gateway_requests_total.labels(model=model, status_code="200").inc()
         try:
-            stream_client: httpx.AsyncClient = app.state.stream_client
-            try:
-                try:
-                    # Check circuit breaker before starting the stream
-                    if not _engine_circuit_breaker._should_allow():
-                        elapsed = time.monotonic() - _engine_circuit_breaker._last_failure_time
-                        remaining = max(0.0, _engine_circuit_breaker.recovery_timeout - elapsed)
-                        raise CircuitBreakerOpen(_engine_circuit_breaker.recovery_timeout, remaining)
-                except CircuitBreakerOpen:
-                    error_chunk = json.dumps({
-                        "error": {"message": "Engine circuit breaker open", "type": "server_error"}
-                    })
-                    yield f"data: {error_chunk}\n\n"
+            async for kind, data in _iter_engine_tokens(worker_url, payload):
+                if kind == "error":
+                    yield _sse_error(data)
                     return
-
-                async with stream_client.stream(
-                    "POST",
-                    f"{worker_url}/generate/stream",
-                    json=payload,
-                    headers=_request_id_headers(),
-                ) as resp:
-                    async for line in resp.aiter_lines():
-                        if not line.startswith("data: "):
-                            continue
-                        raw = line[len("data: "):]
-                        if raw == "[DONE]":
-                            yield "data: [DONE]\n\n"
-                            _engine_circuit_breaker._record_success()
-                            break
-                        token_data = json.loads(raw)
-                        chunk = CompletionChunk(
-                            id=completion_id,
-                            created=now_unix(),
-                            model=model,
-                            choices=[CompletionChunkChoice(
-                                index=0,
-                                text=token_data.get("token", ""),
-                                finish_reason=token_data.get("finish_reason"),
-                            )],
-                        )
-                        yield f"data: {chunk.model_dump_json()}\n\n"
-            except httpx.ConnectError:
-                _engine_circuit_breaker._record_failure()
-                error_chunk = json.dumps({"error": {"message": "Model service unreachable", "type": "server_error"}})
-                yield f"data: {error_chunk}\n\n"
+                if kind == "done":
+                    yield "data: [DONE]\n\n"
+                    return
+                # kind == "token"
+                chunk = CompletionChunk(
+                    id=completion_id,
+                    created=now_unix(),
+                    model=model,
+                    choices=[CompletionChunkChoice(
+                        index=0,
+                        text=data.get("token", ""),
+                        finish_reason=data.get("finish_reason"),
+                    )],
+                )
+                yield f"data: {chunk.model_dump_json()}\n\n"
         finally:
             _in_flight_count -= 1
 
@@ -644,10 +610,11 @@ def _stream_completion(worker_url: str, payload: dict, model: str, completion_id
 # ---------------------------------------------------------------------------
 
 @app.post("/v1/chat/completions")
-async def create_chat_completion(request: ChatCompletionRequest):
-    global _in_flight_count
-    _check_gateway_draining()
-    _check_rate_limit()
+async def create_chat_completion(
+    request: ChatCompletionRequest,
+    _drain: None = Depends(_check_gateway_draining),
+    _rate: None = Depends(_check_rate_limit),
+):
     # Reject unsupported features clearly
     for msg in request.messages:
         if msg.tool_calls:
@@ -695,26 +662,7 @@ async def create_chat_completion(request: ChatCompletionRequest):
     if request.stream:
         return _stream_chat_completion(worker_url, engine_payload, request.model, completion_id)
 
-    # 3. Non-streaming generation
-    _in_flight_count += 1
-    try:
-        try:
-            resp = await _engine_post(http_client, f"{worker_url}/generate", engine_payload)
-        except httpx.ConnectError:
-            gateway_metrics.gateway_requests_total.labels(model=request.model, status_code="503").inc()
-            raise InferenceServerError(
-                ErrorCode.ENGINE_UNREACHABLE,
-                f"Model service '{request.model}' is unreachable.",
-            )
-
-        duration = time.monotonic() - start_time
-        gateway_metrics.gateway_request_duration_seconds.labels(model=request.model).observe(duration)
-        gateway_metrics.gateway_requests_total.labels(model=request.model, status_code=str(resp.status_code)).inc()
-
-        if resp.status_code >= 400:
-            raise HTTPException(status_code=resp.status_code, detail=resp.text)
-
-        data = resp.json()
+    def _build(data: dict):
         return ChatCompletionResponse(
             id=completion_id,
             created=now_unix(),
@@ -730,8 +678,10 @@ async def create_chat_completion(request: ChatCompletionRequest):
                 total_tokens=data.get("prompt_tokens", 0) + data.get("tokens_generated", 0),
             ),
         ).model_dump()
-    finally:
-        _in_flight_count -= 1
+
+    return await _run_unary_completion(
+        worker_url, engine_payload, request.model, _build, start_time=start_time,
+    )
 
 
 def _stream_chat_completion(worker_url: str, payload: dict, model: str, completion_id: str):
@@ -755,81 +705,53 @@ def _stream_chat_completion(worker_url: str, payload: dict, model: str, completi
             )
             yield f"data: {first_chunk.model_dump_json()}\n\n"
 
-            stream_client: httpx.AsyncClient = app.state.stream_client
-            try:
-                try:
-                    # Check circuit breaker before starting the stream
-                    if not _engine_circuit_breaker._should_allow():
-                        elapsed = time.monotonic() - _engine_circuit_breaker._last_failure_time
-                        remaining = max(0.0, _engine_circuit_breaker.recovery_timeout - elapsed)
-                        raise CircuitBreakerOpen(_engine_circuit_breaker.recovery_timeout, remaining)
-                except CircuitBreakerOpen:
-                    error_chunk = json.dumps({
-                        "error": {"message": "Engine circuit breaker open", "type": "server_error"}
-                    })
-                    yield f"data: {error_chunk}\n\n"
+            async for kind, data in _iter_engine_tokens(worker_url, payload):
+                if kind == "error":
+                    yield _sse_error(data)
                     return
-
-                async with stream_client.stream(
-                    "POST",
-                    f"{worker_url}/generate/stream",
-                    json=payload,
-                    headers=_request_id_headers(),
-                ) as resp:
-                    async for line in resp.aiter_lines():
-                        if not line.startswith("data: "):
-                            continue
-                        raw = line[len("data: "):]
-                        if raw == "[DONE]":
-                            # Send final chunk with finish_reason
-                            final_chunk = ChatCompletionChunk(
-                                id=completion_id,
-                                created=now_unix(),
-                                model=model,
-                                choices=[ChatCompletionChunkChoice(
-                                    index=0,
-                                    delta=ChatCompletionChunkDelta(),
-                                    finish_reason="stop",
-                                )],
-                            )
-                            yield f"data: {final_chunk.model_dump_json()}\n\n"
-                            yield "data: [DONE]\n\n"
-                            _engine_circuit_breaker._record_success()
-                            break
-                        token_data = json.loads(raw)
-                        token_text = token_data.get("token", "")
-                        finish = token_data.get("finish_reason")
-
-                        if finish:
-                            # This is the last token event before [DONE]
-                            if token_text:
-                                chunk = ChatCompletionChunk(
-                                    id=completion_id,
-                                    created=now_unix(),
-                                    model=model,
-                                    choices=[ChatCompletionChunkChoice(
-                                        index=0,
-                                        delta=ChatCompletionChunkDelta(content=token_text),
-                                    )],
-                                )
-                                yield f"data: {chunk.model_dump_json()}\n\n"
-                            continue  # [DONE] will follow
-
-                        if token_text:
-                            chunk = ChatCompletionChunk(
-                                id=completion_id,
-                                created=now_unix(),
-                                model=model,
-                                choices=[ChatCompletionChunkChoice(
-                                    index=0,
-                                    delta=ChatCompletionChunkDelta(content=token_text),
-                                )],
-                            )
-                            yield f"data: {chunk.model_dump_json()}\n\n"
-            except httpx.ConnectError:
-                _engine_circuit_breaker._record_failure()
-                error_chunk = json.dumps({"error": {"message": "Model service unreachable", "type": "server_error"}})
-                yield f"data: {error_chunk}\n\n"
+                if kind == "done":
+                    # Send final chunk with finish_reason, then [DONE]
+                    final_chunk = ChatCompletionChunk(
+                        id=completion_id,
+                        created=now_unix(),
+                        model=model,
+                        choices=[ChatCompletionChunkChoice(
+                            index=0,
+                            delta=ChatCompletionChunkDelta(),
+                            finish_reason="stop",
+                        )],
+                    )
+                    yield f"data: {final_chunk.model_dump_json()}\n\n"
+                    yield "data: [DONE]\n\n"
+                    return
+                # kind == "token"
+                token_text = data.get("token", "")
+                finish = data.get("finish_reason")
+                if finish:
+                    # Last token event before [DONE]
+                    if token_text:
+                        chunk = ChatCompletionChunk(
+                            id=completion_id,
+                            created=now_unix(),
+                            model=model,
+                            choices=[ChatCompletionChunkChoice(
+                                index=0,
+                                delta=ChatCompletionChunkDelta(content=token_text),
+                            )],
+                        )
+                        yield f"data: {chunk.model_dump_json()}\n\n"
+                    continue  # [DONE] will follow
+                if token_text:
+                    chunk = ChatCompletionChunk(
+                        id=completion_id,
+                        created=now_unix(),
+                        model=model,
+                        choices=[ChatCompletionChunkChoice(
+                            index=0,
+                            delta=ChatCompletionChunkDelta(content=token_text),
+                        )],
+                    )
+                    yield f"data: {chunk.model_dump_json()}\n\n"
         finally:
             _in_flight_count -= 1
 

@@ -85,6 +85,7 @@ class GatewaySection(BaseModel):
     log_level: str = "INFO"
     rate_limit_rps: float = 100.0
     rate_limit_burst: int = 200
+    max_request_body_bytes: int = 1_048_576  # 1 MB
 
 
 class EngineSection(BaseModel):
