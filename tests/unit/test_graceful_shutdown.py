@@ -81,34 +81,34 @@ def test_503_when_draining(_engine_api):
 
 
 def test_health_200_when_draining(_engine_api):
-    """/health must stay 200 during drain (K8s liveness)."""
+    """/healthz must stay 200 during drain (K8s liveness)."""
     api_mod = _engine_api
     api_mod._draining = True
 
     client = TestClient(api_mod.app, raise_server_exceptions=False)
-    resp = client.get("/health")
+    resp = client.get("/healthz")
     assert resp.status_code == 200
 
 
 def test_ready_503_when_draining(_engine_api):
-    """/ready returns 503 during drain."""
+    """/readyz returns 503 during drain."""
     api_mod = _engine_api
     api_mod._draining = True
 
     client = TestClient(api_mod.app, raise_server_exceptions=False)
-    resp = client.get("/ready")
+    resp = client.get("/readyz")
     assert resp.status_code == 503
     body = resp.json()
     assert body["reason"] == "draining"
 
 
 def test_ready_200_when_not_draining(_engine_api):
-    """/ready returns 200 when not draining and engine is ready."""
+    """/readyz returns 200 when not draining and engine is ready."""
     api_mod = _engine_api
     api_mod._draining = False
 
     client = TestClient(api_mod.app, raise_server_exceptions=False)
-    resp = client.get("/ready")
+    resp = client.get("/readyz")
     assert resp.status_code == 200
 
 
@@ -203,7 +203,7 @@ def test_gateway_503_when_draining():
 
 
 def test_gateway_ready_503_when_draining():
-    """Gateway /ready returns 503 when draining."""
+    """Gateway /readyz returns 503 when draining."""
     import data_plane.gateway.routing as gw_mod
 
     orig_draining = gw_mod._draining
@@ -211,7 +211,7 @@ def test_gateway_ready_503_when_draining():
 
     try:
         client = TestClient(gw_mod.app, raise_server_exceptions=False)
-        resp = client.get("/ready")
+        resp = client.get("/readyz")
         assert resp.status_code == 503
         assert resp.json()["reason"] == "draining"
     finally:
@@ -219,7 +219,7 @@ def test_gateway_ready_503_when_draining():
 
 
 def test_gateway_health_200_when_draining():
-    """Gateway /health stays 200 even when draining."""
+    """Gateway /healthz stays 200 even when draining."""
     import data_plane.gateway.routing as gw_mod
 
     orig_draining = gw_mod._draining
@@ -227,7 +227,7 @@ def test_gateway_health_200_when_draining():
 
     try:
         client = TestClient(gw_mod.app, raise_server_exceptions=False)
-        resp = client.get("/health")
+        resp = client.get("/healthz")
         assert resp.status_code == 200
     finally:
         gw_mod._draining = orig_draining

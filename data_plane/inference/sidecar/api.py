@@ -167,31 +167,6 @@ app.add_middleware(RequestIDMiddleware)
 register_error_handlers(app)
 
 
-@app.get("/health", tags=["health"])
-async def health_check():
-    """Liveness probe."""
-    if _manager is None:
-        return JSONResponse(
-            status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
-            content={"status": "initializing"},
-        )
-    return {"status": "ok"}
-
-
-@app.get("/ready", tags=["health"])
-async def readiness_check():
-    """Readiness probe — only ready when initial model is loaded."""
-    if _manager is None or not _manager.is_ready:
-        raise InferenceServerError(
-            ErrorCode.SIDECAR_NOT_READY,
-            "Artifact Manager loading initial model.",
-        )
-    return {
-        "status": "ready",
-        "resident_models": list(_manager.model_registry.keys()),
-    }
-
-
 @app.get("/healthz", tags=["health"])
 async def healthz():
     """Liveness probe — always returns 200."""

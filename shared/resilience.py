@@ -101,15 +101,33 @@ class CircuitBreaker:
 
     # -- public API ----------------------------------------------------------
 
-    async def call(self, func: Callable[..., Any], *args: Any, **kwargs: Any) -> Any:
-        """Invoke *func* through the circuit breaker.
+    def allow(self) -> None:
+        """Raise ``CircuitBreakerOpen`` if the breaker is currently rejecting calls.
 
-        Raises ``CircuitBreakerOpen`` when the breaker is open.
+        This is the manual counterpart to :meth:`call` for callers that can't
+        wrap their operation in a single awaitable (e.g. streaming HTTP, which
+        needs an ``async with`` context manager). Callers must pair this with
+        :meth:`record_success` / :meth:`record_failure`.
         """
         if not self._should_allow():
             elapsed = time.monotonic() - self._last_failure_time
             remaining = max(0.0, self.recovery_timeout - elapsed)
             raise CircuitBreakerOpen(self.recovery_timeout, remaining)
+
+    def record_success(self) -> None:
+        """Record a successful call. Public alias for manual use."""
+        self._record_success()
+
+    def record_failure(self) -> None:
+        """Record a failed call. Public alias for manual use."""
+        self._record_failure()
+
+    async def call(self, func: Callable[..., Any], *args: Any, **kwargs: Any) -> Any:
+        """Invoke *func* through the circuit breaker.
+
+        Raises ``CircuitBreakerOpen`` when the breaker is open.
+        """
+        self.allow()
 
         try:
             result = await func(*args, **kwargs)

@@ -30,6 +30,7 @@ class GatewayConfig(BaseSettings):
     log_level: str = GatewaySection.model_fields["log_level"].default
     rate_limit_rps: float = GatewaySection.model_fields["rate_limit_rps"].default
     rate_limit_burst: int = GatewaySection.model_fields["rate_limit_burst"].default
+    max_request_body_bytes: int = GatewaySection.model_fields["max_request_body_bytes"].default
     otlp_endpoint: Optional[str] = None
 
     @classmethod

@@ -5,6 +5,8 @@ Provides:
 - ``RequestIDMiddleware`` — raw ASGI middleware (not ``BaseHTTPMiddleware``)
   that generates or propagates ``X-Request-ID`` headers without buffering
   streaming responses.
+- ``RequestSizeLimitMiddleware`` — raw ASGI middleware that rejects request
+  bodies larger than a configurable byte limit (default 1 MB).
 - ``register_error_handlers`` — wires up ``InferenceServerError`` handling
   on a FastAPI app, with optional OpenAI-compatible error format.
 """
@@ -64,6 +66,70 @@ class RequestIDMiddleware:
             await self.app(scope, receive, send_with_request_id)
         finally:
             request_id_ctx.reset(token)
+
+
+# ---------------------------------------------------------------------------
+# Request body size limit middleware
+# ---------------------------------------------------------------------------
+
+_DEFAULT_MAX_REQUEST_BODY_BYTES = 1_048_576  # 1 MB
+
+
+class RequestSizeLimitMiddleware:
+    """ASGI middleware that rejects request bodies larger than ``max_bytes``.
+
+    This runs at the raw ASGI layer so it can short-circuit oversized requests
+    before the app buffers the full body. Should typically be installed as the
+    *outermost* middleware so oversized requests are rejected before any
+    per-request state (request IDs, tracing spans, ...) is allocated.
+    """
+
+    def __init__(self, app, max_bytes: int = _DEFAULT_MAX_REQUEST_BODY_BYTES):  # type: ignore[no-untyped-def]
+        self.app = app
+        self.max_bytes = max_bytes
+
+    async def __call__(self, scope, receive, send):  # type: ignore[no-untyped-def]
+        if scope["type"] != "http":
+            await self.app(scope, receive, send)
+            return
+
+        body_size = 0
+        exceeded = False
+
+        # Read the first message to check size
+        first_message = await receive()
+        if first_message["type"] == "http.request":
+            chunk = first_message.get("body", b"")
+            body_size += len(chunk)
+            if body_size > self.max_bytes:
+                exceeded = True
+
+        if exceeded:
+            response = JSONResponse(
+                status_code=413,
+                content={
+                    "error": {
+                        "message": f"Request body too large (max {self.max_bytes} bytes)",
+                        "type": "invalid_request_error",
+                        "param": None,
+                        "code": None,
+                    }
+                },
+            )
+            await response(scope, receive, send)
+            return
+
+        # Replay the first message and forward
+        replay_done = False
+
+        async def replay_receive():
+            nonlocal replay_done
+            if not replay_done:
+                replay_done = True
+                return first_message
+            return await receive()
+
+        await self.app(scope, replay_receive, send)
 
 
 # ---------------------------------------------------------------------------

@@ -342,7 +342,7 @@ class TestGatewayErrorFormat:
         assert "type" in data["error"]
 
     def test_health_still_works(self, gateway_client):
-        resp = gateway_client.get("/health")
+        resp = gateway_client.get("/healthz")
         assert resp.status_code == 200
 
 
