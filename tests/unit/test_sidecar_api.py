@@ -4,10 +4,14 @@ Tests health, ready, load, unload, registry, and adapter endpoints
 with a mocked ArtifactManager (no real HF downloads).
 """
 
+import asyncio
+import os
+import time
 from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
 
+from data_plane.inference.sidecar.artifact_manager import ArtifactManager
 from data_plane.inference.sidecar.config import SidecarConfig
 
 
@@ -26,7 +30,7 @@ def mock_manager():
     }
     manager.adapter_registry = {}
     manager.load_model = AsyncMock(return_value="/mnt/models/new-model/latest")
-    manager.unload_model = MagicMock()
+    manager.unload_model = AsyncMock()
     manager.fetch_adapter = AsyncMock(return_value="/mnt/models/adapter/latest")
     return manager
 
@@ -176,3 +180,170 @@ class TestSidecarConfig:
         config = SidecarConfig()
         assert config.l1_capacity_mb == 1024
         assert config.max_adapters == 5
+
+
+# ---------------------------------------------------------------------------
+# R3.4 — Secret Management
+# ---------------------------------------------------------------------------
+
+
+@pytest.fixture
+def make_manager(tmp_path):
+    """Factory to create an ArtifactManager with a tmp shared volume and optional token file."""
+
+    def _factory(hf_token_file=None):
+        config = SidecarConfig(
+            shared_volume=str(tmp_path / "models"),
+            registry_path=str(tmp_path / "registry.json"),
+            hf_token_file=hf_token_file,
+        )
+        return ArtifactManager(config=config)
+
+    return _factory
+
+
+class TestHfTokenResolution:
+    """Tests for HF token resolution logic in ArtifactManager."""
+
+    def test_get_hf_token_from_file(self, tmp_path, make_manager):
+        token_file = tmp_path / "token.txt"
+        token_file.write_text("hf_abc123\n")
+        mgr = make_manager(hf_token_file=str(token_file))
+        assert mgr._get_hf_token() == "hf_abc123"
+
+    def test_get_hf_token_from_env(self, monkeypatch, make_manager):
+        monkeypatch.setenv("HF_TOKEN", "hf_envtoken")
+        mgr = make_manager()
+        assert mgr._get_hf_token() == "hf_envtoken"
+
+    def test_get_hf_token_file_takes_precedence(self, tmp_path, monkeypatch, make_manager):
+        token_file = tmp_path / "token.txt"
+        token_file.write_text("hf_from_file\n")
+        monkeypatch.setenv("HF_TOKEN", "hf_from_env")
+        mgr = make_manager(hf_token_file=str(token_file))
+        assert mgr._get_hf_token() == "hf_from_file"
+
+    def test_get_hf_token_returns_none(self, monkeypatch, make_manager):
+        monkeypatch.delenv("HF_TOKEN", raising=False)
+        mgr = make_manager()
+        assert mgr._get_hf_token() is None
+
+    def test_startup_raises_on_missing_token_file(self, make_manager):
+        with pytest.raises(FileNotFoundError, match="does not exist"):
+            make_manager(hf_token_file="/nonexistent/token.txt")
+
+    def test_snapshot_download_receives_token(self, tmp_path, make_manager):
+        """Verify that _fetch_from_external_storage passes token= to snapshot_download."""
+        token_file = tmp_path / "token.txt"
+        token_file.write_text("hf_mytoken\n")
+        mgr = make_manager(hf_token_file=str(token_file))
+
+        with patch("data_plane.inference.sidecar.artifact_manager.snapshot_download") as mock_sd:
+            mock_sd.return_value = None
+            asyncio.get_event_loop().run_until_complete(
+                mgr._fetch_from_external_storage("model", "org/model", "main")
+            )
+            mock_sd.assert_called_once()
+            _, kwargs = mock_sd.call_args
+            assert kwargs["token"] == "hf_mytoken"
+
+
+# ---------------------------------------------------------------------------
+# R5.4 — Model Download Progress Reporting
+# ---------------------------------------------------------------------------
+
+
+class TestDownloadProgress:
+    """Tests for download progress tracking."""
+
+    def test_get_dir_size_empty(self, tmp_path):
+        empty_dir = tmp_path / "empty"
+        empty_dir.mkdir()
+        assert ArtifactManager._get_dir_size(str(empty_dir)) == 0
+        # Nonexistent dir
+        assert ArtifactManager._get_dir_size(str(tmp_path / "nonexistent")) == 0
+
+    def test_get_dir_size_with_files(self, tmp_path):
+        d = tmp_path / "data"
+        d.mkdir()
+        (d / "a.bin").write_bytes(b"x" * 100)
+        (d / "b.bin").write_bytes(b"y" * 250)
+        sub = d / "sub"
+        sub.mkdir()
+        (sub / "c.bin").write_bytes(b"z" * 50)
+        assert ArtifactManager._get_dir_size(str(d)) == 400
+
+    def test_download_progress_entry_lifecycle(self, tmp_path, make_manager):
+        """Progress entry exists during download and is removed after."""
+        mgr = make_manager()
+        captured_progress = {}
+
+        def fake_snapshot_download(**kwargs):
+            # During download, progress entry should exist
+            captured_progress.update(dict(mgr.download_progress))
+
+        with patch("data_plane.inference.sidecar.artifact_manager.snapshot_download", side_effect=fake_snapshot_download):
+            asyncio.get_event_loop().run_until_complete(
+                mgr._fetch_from_external_storage("model", "org/model", "main")
+            )
+
+        # During download the entry was present
+        assert "org/model" in captured_progress
+        assert "downloaded_bytes" in captured_progress["org/model"]
+        # After download it should be gone
+        assert "org/model" not in mgr.download_progress
+
+    def test_status_endpoint_returns_progress(self, test_client, mock_manager):
+        """Downloading model with progress data shows download_progress in /status."""
+        mock_manager.model_registry["downloading-model"] = {
+            "model_id": "downloading-model",
+            "version": "main",
+            "status": "downloading",
+        }
+        mock_manager.download_progress = {
+            "downloading-model": {
+                "downloaded_bytes": 5000,
+                "total_bytes": None,
+                "started_at": 1000.0,
+            }
+        }
+        response = test_client.get("/status/downloading-model")
+        assert response.status_code == 200
+        data = response.json()
+        assert "download_progress" in data
+        assert data["download_progress"]["downloaded_bytes"] == 5000
+
+    def test_status_endpoint_loaded_model_no_progress(self, test_client, mock_manager):
+        """Loaded model should not include download_progress."""
+        mock_manager.download_progress = {}
+        response = test_client.get("/status/test-model")
+        assert response.status_code == 200
+        data = response.json()
+        assert "download_progress" not in data
+
+    def test_status_endpoint_404_unknown_model(self, test_client, mock_manager):
+        response = test_client.get("/status/unknown-model")
+        assert response.status_code == 404
+
+    def test_registry_models_includes_progress(self, test_client, mock_manager):
+        """GET /registry/models merges download_progress for downloading models."""
+        mock_manager.model_registry["dl-model"] = {
+            "model_id": "dl-model",
+            "version": "main",
+            "status": "downloading",
+        }
+        mock_manager.download_progress = {
+            "dl-model": {
+                "downloaded_bytes": 1234,
+                "total_bytes": None,
+                "started_at": 999.0,
+            }
+        }
+        response = test_client.get("/registry/models")
+        assert response.status_code == 200
+        data = response.json()
+        assert "dl-model" in data
+        assert "download_progress" in data["dl-model"]
+        assert data["dl-model"]["download_progress"]["downloaded_bytes"] == 1234
+        # Loaded model should NOT have download_progress
+        assert "download_progress" not in data["test-model"]

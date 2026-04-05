@@ -36,6 +36,14 @@ except ImportError:
         pass
 
 
+# Default configuration values
+_DEFAULTS = {
+    "sidecar_grpc_url": "localhost:50051",
+    "num_blocks": 1024,
+    "block_size_bytes": 131072,
+}
+
+
 class SidecarOffloadingSpec(OffloadingSpec):
     """Configures vLLM to offload KV blocks to the sidecar over gRPC.
 
@@ -49,10 +57,18 @@ class SidecarOffloadingSpec(OffloadingSpec):
     def __init__(self, vllm_config=None):
         super().__init__(vllm_config)
 
+        # Merge extra_config with defaults — supports both vLLM config path
+        # and fallback (no vLLM) path.
+        # When vLLM is available, OffloadingSpec populates self.extra_config
+        # from vllm_config. When it is not, we read it manually.
         extra = getattr(self, "extra_config", None) or {}
-        self._grpc_url = extra.get("sidecar_grpc_url", "localhost:50051")
-        self._num_blocks = int(extra.get("num_blocks", 1024))
-        self._block_size = int(extra.get("block_size_bytes", 131072))
+        if not extra and vllm_config is not None:
+            kv_cfg = getattr(vllm_config, "kv_transfer_config", None)
+            if kv_cfg is not None:
+                extra = getattr(kv_cfg, "kv_connector_extra_config", None) or {}
+        self._grpc_url = extra.get("sidecar_grpc_url", _DEFAULTS["sidecar_grpc_url"])
+        self._num_blocks = int(extra.get("num_blocks", _DEFAULTS["num_blocks"]))
+        self._block_size = int(extra.get("block_size_bytes", _DEFAULTS["block_size_bytes"]))
 
         block_size = getattr(self, "offloaded_block_size", 16)
         self._backend = SidecarBackend(self._num_blocks, block_size=block_size)

@@ -144,3 +144,29 @@ engine_gpu_power_watts = Gauge(
     "GPU power draw in watts",
     ["device"]
 )
+
+# --- KV offload metrics ---
+
+engine_kv_offload_operations_total = Counter(
+    "engine_kv_offload_operations_total",
+    "Total KV offload operations",
+    ["op", "status"]
+)
+
+engine_kv_offload_duration_seconds = Histogram(
+    "engine_kv_offload_duration_seconds",
+    "Duration of KV offload operations in seconds",
+    ["op"]
+)
+
+engine_kv_offload_bytes_total = Counter(
+    "engine_kv_offload_bytes_total",
+    "Total bytes transferred via KV offload",
+    ["direction"]
+)
+
+# Drain state gauge (1 = draining, 0 = normal)
+engine_draining = Gauge(
+    "engine_draining",
+    "Whether the engine is draining (1) or accepting requests (0)"
+)

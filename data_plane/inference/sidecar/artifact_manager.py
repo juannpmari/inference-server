@@ -1,6 +1,7 @@
 import asyncio
 import logging
 import os
+import time
 from typing import Dict, List, Optional
 
 from huggingface_hub import snapshot_download
@@ -28,8 +29,18 @@ class ArtifactManager:
         self.is_ready = False
         self.max_resident_adapters = self.config.max_adapters
 
+        # Download progress tracking: {identifier: {"downloaded_bytes": int, "total_bytes": Optional[int], "started_at": float}}
+        self.download_progress: Dict[str, dict] = {}
+
         # Ensure the shared volume path exists
         os.makedirs(self.config.shared_volume, exist_ok=True)
+
+        # Validate hf_token_file if configured
+        if self.config.hf_token_file is not None and not os.path.exists(self.config.hf_token_file):
+            raise FileNotFoundError(
+                f"Configured hf_token_file does not exist: {self.config.hf_token_file}"
+            )
+
         logger.info(f"Artifact Manager initialized. Storage path: {self.config.shared_volume}")
 
         # Restore registry from disk if available
@@ -62,6 +73,33 @@ class ArtifactManager:
         except OSError as e:
             logger.error(f"Could not persist registry: {e}")
 
+    def _get_hf_token(self) -> Optional[str]:
+        """Resolve HuggingFace token from file or environment variable."""
+        if self.config.hf_token_file is not None:
+            with open(self.config.hf_token_file) as f:
+                return f.read().strip()
+        token = os.environ.get("HF_TOKEN")
+        return token if token else None
+
+    @staticmethod
+    def _get_dir_size(path: str) -> int:
+        """Walk a directory and sum file sizes. Returns 0 if dir doesn't exist."""
+        if not os.path.exists(path):
+            return 0
+        total = 0
+        for dirpath, _dirnames, filenames in os.walk(path):
+            for fname in filenames:
+                total += os.path.getsize(os.path.join(dirpath, fname))
+        return total
+
+    async def _monitor_download_progress(self, identifier: str, target_dir: str):
+        """Periodically update download_progress with current directory size."""
+        while identifier in self.download_progress:
+            current_size = self._get_dir_size(target_dir)
+            if identifier in self.download_progress:
+                self.download_progress[identifier]["downloaded_bytes"] = current_size
+            await asyncio.sleep(2)
+
     async def _fetch_from_external_storage(self, artifact_type: str, identifier: str, version: str) -> str:
         """
         Download model/adapter files from HuggingFace Hub.
@@ -81,12 +119,30 @@ class ArtifactManager:
         logger.info(f"Downloading {artifact_type} {identifier} v{version} from HuggingFace Hub...")
 
         os.makedirs(local_target_path, exist_ok=True)
-        await asyncio.to_thread(
-            snapshot_download,
-            repo_id=identifier,
-            revision=version if version != "latest" else None,
-            local_dir=local_target_path,
-        )
+
+        # Track download progress
+        self.download_progress[identifier] = {
+            "downloaded_bytes": 0,
+            "total_bytes": None,
+            "started_at": time.time(),
+        }
+        monitor_task = asyncio.create_task(self._monitor_download_progress(identifier, local_target_path))
+
+        try:
+            await asyncio.to_thread(
+                snapshot_download,
+                repo_id=identifier,
+                revision=version if version != "latest" else None,
+                local_dir=local_target_path,
+                token=self._get_hf_token(),
+            )
+        finally:
+            self.download_progress.pop(identifier, None)
+            monitor_task.cancel()
+            try:
+                await monitor_task
+            except asyncio.CancelledError:
+                pass
 
         logger.info(f"Download complete. {artifact_type} files ready at: {local_target_path}")
         return local_target_path

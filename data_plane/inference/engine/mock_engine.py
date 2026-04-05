@@ -81,6 +81,11 @@ class MockLLMEngine:
 
         logger.info("MockLLMEngine initialized")
 
+    @property
+    def in_flight_count(self) -> int:
+        """Number of requests currently being processed."""
+        return len(self.request_futures) + len(self.request_queues)
+
     def is_ready(self) -> bool:
         """Check if engine is ready"""
         return True

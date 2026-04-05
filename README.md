@@ -42,6 +42,10 @@ KV cache management operates at three tiers:
 
 **Engine-side offload** integrates with vLLM's plugin architecture through `SidecarOffloadingSpec`. The handler queues transfer jobs asynchronously and executes them during the scheduler's poll cycle, avoiding blocking the inference loop. Hash-based deduplication enables zero-copy prefix reuse across requests.
 
+### Graceful Shutdown with Request Draining
+
+Both the engine and gateway implement drain-aware shutdown to avoid dropping in-flight requests during deployments or scaling events. On SIGTERM, each service sets a drain flag that immediately rejects new requests with HTTP 503 and a `Retry-After` header, then waits for in-flight work to complete before tearing down. The engine polls its active request count (tracked via `request_futures` and `request_queues`) every 100ms, keeping the continuous batching loop alive so queued tokens continue generating. A configurable `drain_timeout` (default 30s, settable via `ENGINE_DRAIN_TIMEOUT` / `GATEWAY_DRAIN_TIMEOUT`) caps the wait — any requests still running after the deadline are cancelled and the process exits. The `/ready` endpoint returns 503 during drain so Kubernetes stops routing traffic, while `/health` stays 200 to prevent premature pod restarts. K8s manifests set `terminationGracePeriodSeconds` above the drain timeout to ensure the SIGKILL doesn't arrive before draining completes.
+
 ### Benchmarking Dispatchers
 
 Three dispatch modes simulate different traffic patterns, each isolating a specific performance dimension:

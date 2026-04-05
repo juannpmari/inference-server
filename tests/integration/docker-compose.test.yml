@@ -1,0 +1,45 @@
+# docker-compose override for integration tests.
+# Usage:
+#   docker compose -f docker-compose.yml -f tests/integration/docker-compose.test.yml up -d
+#   pytest tests/integration/ -v
+#   docker compose -f docker-compose.yml -f tests/integration/docker-compose.test.yml down -v
+
+services:
+  gateway:
+    environment:
+      - GATEWAY_LOG_LEVEL=DEBUG
+      - GATEWAY_REQUEST_TIMEOUT=60.0
+      - GATEWAY_DRAIN_TIMEOUT=10.0
+      - GATEWAY_RATE_LIMIT_RPS=1000.0
+      - GATEWAY_RATE_LIMIT_BURST=2000
+    healthcheck:
+      interval: 5s
+      timeout: 3s
+      retries: 5
+      start_period: 5s
+
+  engine:
+    environment:
+      - ENGINE_ENABLE_ENGINE_MOCK=true
+      - ENGINE_LOG_LEVEL=DEBUG
+      - ENGINE_INFERENCE_TIMEOUT=30.0
+      - ENGINE_SIDECAR_TIMEOUT=40.0
+      - ENGINE_DRAIN_TIMEOUT=10.0
+    healthcheck:
+      interval: 5s
+      timeout: 3s
+      retries: 10
+      start_period: 30s
+    deploy:
+      resources:
+        reservations:
+          devices: []  # No GPU needed for mock engine
+
+  sidecar:
+    environment:
+      - SIDECAR_LOG_LEVEL=DEBUG
+    healthcheck:
+      interval: 5s
+      timeout: 3s
+      retries: 5
+      start_period: 15s

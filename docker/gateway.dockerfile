@@ -19,9 +19,8 @@ RUN uv sync --no-dev --extra gateway
 
 # Copy application code and config
 COPY server_config.yaml ./
-COPY shared/__init__.py ./shared/
-COPY shared/config_loader.py ./shared/
-COPY shared/openai_types.py ./shared/
+COPY shared/ ./shared/
+COPY data_plane/__init__.py ./data_plane/
 COPY data_plane/gateway/ ./data_plane/gateway/
 
 EXPOSE 8000

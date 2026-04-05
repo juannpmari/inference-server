@@ -9,6 +9,14 @@ services:
       - .env
     volumes:
       - ./server_config.yaml:/app/server_config.yaml:ro
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:8000/readyz"]
+      interval: 10s
+      timeout: 5s
+      retries: 3
+      start_period: 10s
+    # environment:
+    #   - GATEWAY_OTLP_ENDPOINT=http://jaeger:4317
     restart: unless-stopped
 
   engine:
@@ -24,9 +32,18 @@ services:
       - ./server_config.yaml:/app/server_config.yaml:ro
       - /usr/lib/wsl:/usr/lib/wsl:ro
     depends_on:
-      - sidecar
+      sidecar:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:8080/startupz"]
+      interval: 10s
+      timeout: 5s
+      retries: 3
+      start_period: 120s
     environment:
       - LD_LIBRARY_PATH=/usr/lib/wsl/lib:/usr/local/cuda/lib64
+      - VLLM_WORKER_MULTIPROC_METHOD=spawn
+      # - ENGINE_OTLP_ENDPOINT=http://jaeger:4317
     deploy:
       resources:
         reservations:
@@ -47,9 +64,16 @@ services:
       - .env
     environment:
       - HF_HUB_DISABLE_XET=1
+      # - SIDECAR_OTLP_ENDPOINT=http://jaeger:4317
     volumes:
       - ./model-store:/mnt/models
       - ./server_config.yaml:/app/server_config.yaml:ro
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:8001/startupz"]
+      interval: 10s
+      timeout: 5s
+      retries: 3
+      start_period: 60s
     # depends_on:
     #   - redis
     restart: unless-stopped
@@ -63,12 +87,22 @@ services:
   #     - redis-data:/data
   #   restart: unless-stopped
 
+  # jaeger:
+  #   image: jaegertracing/all-in-one:latest
+  #   ports:
+  #     - "16686:16686"
+  #     - "4317:4317"
+  #   environment:
+  #     - COLLECTOR_OTLP_ENABLED=true
+  #   restart: unless-stopped
+
   # prometheus:
   #   image: prom/prometheus:latest
   #   ports:
   #     - "9090:9090"
   #   volumes:
   #     - ./docker/prometheus.yml:/etc/prometheus/prometheus.yml:ro
+  #     - ./docker/alerting-rules.yml:/etc/prometheus/alerting-rules.yml:ro
   #   depends_on:
   #     - gateway
   #     - engine

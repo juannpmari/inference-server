@@ -1,0 +1,107 @@
+# ============================================================
+# Inference Server — Unified Configuration Example
+# ============================================================
+# Copy this file to server_config.yaml (or set
+# INFERENCE_SERVER_CONFIG to point at it).
+#
+# Secrets (HF_TOKEN, etc.) should remain in .env.
+# ============================================================
+
+# --- Gateway ---
+gateway:
+  host: "0.0.0.0"
+  port: 8000
+  request_timeout: 300.0        # seconds — must be > engine.inference_timeout
+  drain_timeout: 30.0           # seconds
+  log_json: true
+  log_level: "INFO"
+
+# --- Engine ---
+engine:
+  host: "0.0.0.0"
+  port: 8080
+  model_name: "Qwen/Qwen2-0.5B-Instruct"
+  max_model_len: 16000
+  gpu_memory_utilization: 0.70
+  dtype: "bfloat16"
+  max_pending: 50000
+  temperature: 0.0
+  inference_timeout: 290.0      # seconds — generate endpoint timeout (must be < gateway.request_timeout)
+  enable_lora: true
+  max_loras: 4
+  max_lora_rank: 64
+  adapter_poll_interval: 1.0    # seconds
+  adapter_poll_timeout: 600.0   # seconds
+  sidecar_url: "http://sidecar:8001"
+  sidecar_poll_interval: 2.0    # seconds
+  sidecar_timeout: 600.0        # seconds (wait for sidecar model load)
+  sidecar_grpc_url: "sidecar:50051"
+  model_path: "/models/resident_model"
+  enable_kv_offload: false
+  kv_offload_num_blocks: 1024
+  enable_prefix_caching: true
+  enable_engine_mock: false
+  # GPU monitoring
+  gpu_monitor_enabled: true
+  gpu_poll_interval: 2.0
+  gpu_device_index: 0
+  # Metrics persistence
+  monitoring_storage_backend: "local"
+  monitoring_local_store_path: "/mnt/models/metrics.jsonl"
+  monitoring_buffer_size: 10000
+  monitoring_flush_interval: 30
+  log_json: true
+  log_level: "INFO"
+
+# --- Sidecar ---
+sidecar:
+  host: "0.0.0.0"
+  port: 8001
+  grpc_port: 50051
+  shared_volume: "/mnt/models"
+  model_store_path: "/mnt/models"
+  registry_path: "/mnt/models/registry.json"
+  max_adapters: 10
+  engine_url: "http://engine:8080"
+  initial_model: "Qwen/Qwen2-0.5B-Instruct"
+  initial_model_version: "main"
+  # L1 cache
+  l1_capacity_mb: 512
+  l1_num_blocks: 1024
+  l1_block_size_bytes: 131072   # 128 KB
+  # New fields
+  hf_token_file: null           # path to file containing HF token
+  verify_checksums: true
+  log_json: true
+  log_level: "INFO"
+
+# --- L2 / Redis ---
+l2:
+  redis_host: "redis"
+  redis_port: 6379
+  redis_maxmem: "256mb"
+
+# --- gRPC ---
+grpc:
+  max_message_size: 16777216    # 16 MB
+  rpc_timeout: 5.0              # seconds
+
+# --- Distributed cache ---
+distributed_cache:
+  controller_port: 50051
+  watcher_service_addr: "kv-cache-watcher:50051"
+  storage_node_id: "redis-0"
+  storage_redis_host: "localhost"
+  storage_redis_port: 6379
+  hash_ring_replicas: 3
+  health_check_interval: 5
+
+# --- Prometheus ---
+prometheus:
+  scrape_interval: "15s"
+  evaluation_interval: "15s"
+
+# --- Model routing table (gateway) ---
+routing:
+  model_service_map:
+    "Qwen/Qwen2-0.5B-Instruct": "http://engine:8080"

@@ -5,6 +5,7 @@ kind: Pod
 metadata:
   name: inference-with-sidecar
 spec:
+  terminationGracePeriodSeconds: 45
   containers:
   - name: inference
     image: inference-image
