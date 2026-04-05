@@ -27,8 +27,12 @@ RUN uv run python -m grpc_tools.protoc -I shared/proto \
     sed -i 's/^import kv_cache_pb2/from shared.proto import kv_cache_pb2/' shared/proto/kv_cache_pb2_grpc.py
 
 # Copy application code and config (changes here don't invalidate layers above)
-COPY shared/ ./shared/
-COPY data_plane/ ./data_plane/
+COPY shared/__init__.py ./shared/
+COPY shared/config_loader.py ./shared/
+COPY shared/types.py ./shared/
+COPY data_plane/__init__.py ./data_plane/
+COPY data_plane/inference/__init__.py ./data_plane/inference/
+COPY data_plane/inference/sidecar/ ./data_plane/inference/sidecar/
 COPY server_config.yaml ./
 
 EXPOSE 8001 50051

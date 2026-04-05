@@ -19,7 +19,9 @@ RUN uv sync --no-dev
 
 # Copy application code and config
 COPY server_config.yaml ./
-COPY shared/ ./shared/
+COPY shared/__init__.py ./shared/
+COPY shared/config_loader.py ./shared/
+COPY shared/types.py ./shared/
 COPY control_plane/ ./control_plane/
 
 EXPOSE 8090

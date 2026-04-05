@@ -58,7 +58,9 @@ COPY --from=builder /app/pyproject.toml /app/uv.lock /app/README.md ./
 # Copy application code (changes here do NOT invalidate dependency cache)
 COPY server_config.yaml ./
 COPY shared/ ./shared/
-COPY data_plane/ ./data_plane/
+COPY data_plane/__init__.py ./data_plane/
+COPY data_plane/inference/__init__.py ./data_plane/inference/
+COPY data_plane/inference/engine/ ./data_plane/inference/engine/
 
 # Compile protobuf definitions (must run after copying shared/proto/)
 RUN .venv/bin/python -m grpc_tools.protoc -I shared/proto \
@@ -72,4 +74,5 @@ RUN mkdir -p /mnt/models
 EXPOSE 8080
 
 CMD ["uv", "run", "uvicorn", "data_plane.inference.engine.api:app", \
-     "--host", "0.0.0.0", "--port", "8080"]
+     "--host", "0.0.0.0", "--port", "8080", \
+     "--timeout-graceful-shutdown", "45"]
